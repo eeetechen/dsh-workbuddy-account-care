@@ -171,6 +171,8 @@ dsh plugin --profile web add dsh-workbuddy-account-care
 
 浏览器半（`client.js`）改完刷新页面即可，不用重启进程。
 
+> 维护者：发布流程、凭据存放与迁移见 [docs/RELEASING.md](docs/RELEASING.md)。
+
 **没有定时器要装。** 插件自带定时（每 3 分钟），不需要 systemd、cron、launchd，
 也不需要 DSH 的「自动化任务」。
 
