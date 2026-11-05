@@ -1000,16 +1000,28 @@ async function main() {
   // 4) 记录状态
   if (!DRY_RUN) {
     state.schema = SCHEMA
-    state.baseline = {
-      fingerprint: local.fingerprint,
-      version: local.version,
-      display: local.display,
-      dpkgVersion: local.dpkgVersion,
-      builtinVersionRaw: local.builtinVersionRaw,
-      commit: local.commit,
-      asarSize: local.asarSize,
-      capturedAt: state.baseline?.capturedAt ?? nowIso(),
-      updatedAt: nowIso(),
+    /**
+     * 演练模式**不写基线**。
+     *
+     * 基线是「这台机器上次见到的真实安装」。把 `simulated:9.9.9` 写进去之后，
+     * 下一轮真实检查会看到指纹从模拟值变回真值，于是又报一次「本机更新」，
+     * 在 reportedKeys 里留下一条假事件——测试本身污染了被测对象。
+     * 演练要的是「走一遍动作」，不是「改写历史」。
+     */
+    if (!simulated) {
+      state.baseline = {
+        fingerprint: local.fingerprint,
+        version: local.version,
+        display: local.display,
+        dpkgVersion: local.dpkgVersion,
+        builtinVersionRaw: local.builtinVersionRaw,
+        commit: local.commit,
+        asarSize: local.asarSize,
+        capturedAt: state.baseline?.capturedAt ?? nowIso(),
+        updatedAt: nowIso(),
+      }
+    } else {
+      log('info', '演练模式：不更新基线指纹（避免污染下一轮真实检查）')
     }
     if (upstream.ok) {
       state.upstreamSeen = {
