@@ -345,10 +345,20 @@ window.__ModuleLoader__.load({
       /** 当前这条水印被用户收起过、并且还没到该重新出现的时候。 */
       const snoozed = snoozedRevision !== null && snoozedRevision === revision
 
-      // 没有 workbuddy 会话在跑了 → 解除收起，下次再跑起来时重新提示
+      /**
+       * 收起状态的解除只有一个触发点：workbuddy **重新被用起来**（false → true）。
+       *
+       * 之前写成「只要不在用就解除」，于是没在跑 workbuddy 时点「知道了」，
+       * 下一秒又被解除、卡片立刻弹回来——表现就是「关不掉」。
+       * 现在收起是持久的：只有真的又开始用 WorkBuddy（或插件更新）才会重新提示。
+       */
+      const inUseRef = React.useRef(inUse)
+      const previousInUse = React.useRef(inUse)
       React.useEffect(() => {
-        if (!inUse && !pending && snoozed) setSnoozedRevision(null)
-      }, [inUse, pending, snoozed])
+        inUseRef.current = inUse
+        if (inUse && !previousInUse.current) setSnoozedRevision(null)
+        previousInUse.current = inUse
+      }, [inUse])
 
       // revision 变了（插件更新）→ 一切复位，重新播入场动画
       React.useEffect(() => {
@@ -387,8 +397,9 @@ window.__ModuleLoader__.load({
         leaveTimer.current = setTimeout(() => {
           setSnoozedRevision(revision)
           setLeaving(false)
-          // 还有会话在跑 / 还在等决定 → 过一会儿重新浮出来
+          // 只有「还在用 WorkBuddy」才重新浮出来；没在用就安静地收着
           reshowTimer.current = setTimeout(() => {
+            if (!inUseRef.current) return
             setSnoozedRevision((current) => (current === revision ? null : current))
           }, RESHOW_MS)
         }, LEAVE_MS)

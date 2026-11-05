@@ -1050,7 +1050,7 @@ async function main() {
       updateWatermark({
         level: 'danger',
         title: 'WB 更新了',
-        body: '还能用，但私有接口可能已经变了。选一个结束方式。',
+        body: '还用，你的账号是批发的吗？',
         detail: `${trigger.from} → ${trigger.to}`,
         pendingDisable: true,
         actions: ['soft', 'hard'],
