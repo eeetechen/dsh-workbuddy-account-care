@@ -5,7 +5,7 @@
  * 写下的一个指令文件驱动：
  *
  *   1. 正在跑、且正在用 workbuddy provider 的会话 → 软结束（cancel 当前轮，
- *      并用 followup 送一条「暂停执行，稍等重启」）
+ *      并用 followup 送一条「暂停执行，等待重启 agent 工具」）
  *   2. 把「水印」这一状态发布给浏览器半，由它在 shell.overlay 里画出来
  *
  * **谁在定时**：本插件自己。它每隔 `intervalMinutes`（默认 3）派生一次包内的
@@ -41,7 +41,7 @@
  *     "stopSessions": {                  // 一次性指令，处理完由插件回写 handled
  *       "revision": 7,
  *       "reason": "本机 WorkBuddy 已更新",
- *       "text": "暂停执行，稍等重启。"
+ *       "text": "暂停执行，等待重启 agent 工具。本机 provider 已更新，…"
  *     }
  *   }
  *
@@ -191,7 +191,21 @@ function textOf(content) {
     .join('\n')
 }
 
-const SOFT_STOP_MARKER = '[workbuddy-guard]'
+/**
+ * 软结束消息的正文（默认）。
+ *
+ * 这句话是给「下一轮的那个 agent」看的：它得知道三件事——现在该停下来、
+ * 为什么停（本机 provider 变了）、以及这条消息不是用户本人写的。
+ */
+const DEFAULT_STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，不是你的输入。'
+
+/**
+ * 去重标记：收件箱里已经有这句话的会话，不再重复插一条。
+ *
+ * 用正文里的一个稳定片段而不是额外加前缀——正文就是用户要看到的样子，
+ * 不该为了机器识别再挂一个 `[workbuddy-guard]` 之类的标签。
+ */
+const SOFT_STOP_MARKER = '本条消息由监控插件自动发送'
 
 /**
  * 这条会话是不是「正在用 WorkBuddy」。
@@ -238,7 +252,7 @@ function softStop(agent, reason, text) {
     source: { kind: 'user' },
     content: [{
       type: 'text',
-      text: `${SOFT_STOP_MARKER} ${text}\n\n（本机 WorkBuddy 已更新，dsh-connect-workbuddy 已被停用；本条消息由版本守卫自动发送，不是你的输入。）`,
+      text,
     }],
   })
   return model
@@ -377,7 +391,7 @@ export function apply(ctx, config = {}) {
     const stop = state.stopSessions
     if (stop && Number(stop.revision) > handledStopRevision && !stop.handled) {
       const reason = String(stop.reason || '本机 WorkBuddy 已更新')
-      const text = String(stop.text || '暂停执行，稍等重启。')
+      const text = String(stop.text || DEFAULT_STOP_TEXT)
       let sessions = { stopped: [], skipped: [] }
       let failure = null
       try {

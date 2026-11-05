@@ -134,7 +134,7 @@ dsh-workbuddy-guard（Host 半）
   │
   └─ 每 15 秒读一次 guard.json
         ├─ 水印 → 经 HTTP 端点给浏览器半，由它在 shell.overlay 里画
-        └─ 软结束指令 → cancel 正在跑的轮次 + followup 一条「暂停执行，稍等重启」
+        └─ 软结束指令 → cancel 正在跑的轮次 + followup 一条「暂停执行，等待重启 agent 工具」
 ```
 
 水印的生命周期分在两半，各管一段：
@@ -158,11 +158,11 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 的会话：
 
 1. `agent.cancel({ kind: 'hook' }, { keepInbox: true })` —— 中止当前轮，保留收件箱；
-2. `agent.followup(...)` —— 排一条「暂停执行，稍等重启。」
+2. `agent.followup(...)` —— 排一条「暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，不是你的输入。」
 
 先 cancel 再 followup 是有意的：那条说明才会成为下一轮的唯一输入，而不是被
 这次中止一起丢掉。已经软结束过的会话不会重复插入（收件箱里有
-`[workbuddy-guard]` 标记就跳过），空闲会话不动。
+「本条消息由监控插件自动发送」这句话就跳过），空闲会话不动。
 
 ## 命令
 
