@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WorkBuddy Version Guard",
+    "description": "Companion guard for dsh-connect-workbuddy: disables it after the local WorkBuddy client updates, softly stops the sessions still using it, and leaves a persistent watermark at the top of the UI."
+  }
+}

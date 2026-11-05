@@ -1,0 +1,51 @@
+{
+  "name": "dsh-workbuddy-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy 版本守卫：dsh-connect-workbuddy 的配套辅助插件。本机 WorkBuddy 客户端升级后停用 dsh-connect-workbuddy、软结束正在用它的会话，并在界面顶部挂持久水印；同时自动升级 dsh-connect-workbuddy 自身。",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "workbuddy",
+    "guard"
+  ],
+  "license": "MIT",
+  "bin": {
+    "dsh-workbuddy-guard": "./bin/guard.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./scripts/watch": "./scripts/watch.mjs",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "bin/guard.mjs",
+    "scripts/watch.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "docs/*.png"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

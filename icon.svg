@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="WorkBuddy guard">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8590c"/>
+      <stop offset="1" stop-color="#c92a2a"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 4 56 14v18c0 14-10 24-24 28C18 56 8 46 8 32V14Z" fill="url(#g)"/>
+  <path d="M32 12 48 19v13c0 10-7 17-16 20-9-3-16-10-16-20V19Z" fill="#fff" opacity=".16"/>
+  <path d="M21 26h22M21 34h22M21 42h14" stroke="#fff" stroke-width="3.4" stroke-linecap="round"/>
+</svg>
