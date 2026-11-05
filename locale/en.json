@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "WorkBuddy Version Guard",
+    "title": "dsh-workbuddy Account Care",
     "description": "Companion guard for dsh-connect-workbuddy: compares the WorkBuddy version taken from the official update endpoint and the installer filename (whichever is higher) against a stored baseline, and on mismatch prompts, disables dsh-connect-workbuddy, softly stops the sessions still using it, and leaves a persistent watermark at the top of the UI."
   }
 }

@@ -1,5 +1,7 @@
-# dsh-workbuddy-guard
+# dsh-workbuddy 账号呵护
 
+> `dsh-workbuddy-account-care` —— WorkBuddy 账号的看门人。
+>
 > **本仓库是 [`dsh-connect-workbuddy`](https://github.com/dingminhua/dsh-connect-workbuddy) 的配套辅助插件——它不提供任何模型能力，只为那个插件踩刹车。**
 >
 > **安装本插件之前，请先安装 `dsh-connect-workbuddy`。** 没有它，本插件不产生任何效果。
@@ -27,7 +29,7 @@ dsh plugin --profile web add dsh-connect-workbuddy
 
 # 2) 确认它已被选中、且模型选择器里能看到 WorkBuddy 的模型
 #    然后才装本守卫
-dsh plugin --profile web add dsh-workbuddy-guard
+dsh plugin --profile web add dsh-workbuddy-account-care
 ```
 
 **没装就完全不动。** 守卫每次检查前先确认 `dsh-connect-workbuddy` 真的在
@@ -149,17 +151,25 @@ macOS 在 `/Applications/WorkBuddy.app/Contents`），漏读就静默降级；�
 升级后想恢复：
 
 ```bash
-npx dsh-workbuddy-guard check --enable
+npx dsh-workbuddy-account-care check --enable
 ```
 
 ## 安装
 
-```bash
-# 从目录/压缩包
-dsh plugin --profile web add /path/to/dsh-workbuddy-guard
+三种都行，装完都要**重启 DSH**——Host 半只有重启才会换。
 
-# 然后重启 DSH，或刷新 Web 页面
+```bash
+# 1) 直接指向本地目录（开发时最方便，改完只需重启 Host）
+dsh plugin --profile web add link:/path/to/dsh-workbuddy-account-care
+
+# 2) 装 GitHub Release 里的 tarball（推荐给使用者）
+dsh plugin --profile web add /path/to/dsh-workbuddy-account-care-0.0.3.tgz
+
+# 3) 如果以后发到了 npm
+dsh plugin --profile web add dsh-workbuddy-account-care
 ```
+
+浏览器半（`client.js`）改完刷新页面即可，不用重启进程。
 
 **没有定时器要装。** 插件自带定时（每 3 分钟），不需要 systemd、cron、launchd，
 也不需要 DSH 的「自动化任务」。
@@ -167,8 +177,8 @@ dsh plugin --profile web add /path/to/dsh-workbuddy-guard
 装完之后可以这样确认它在工作：
 
 ```bash
-npx dsh-workbuddy-guard status    # 守卫状态：目标插件版本 / 启用与否 / 水印 / 检查次数
-npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
+npx dsh-workbuddy-account-care status    # 守卫状态：目标插件版本 / 启用与否 / 水印 / 检查次数
+npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 ```
 
 `status` 里 `plugin on` 指的是 **`dsh-connect-workbuddy`** 是否仍被选中——
@@ -273,14 +283,14 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 清除优先于发布：清除串在第一次发布之前，所以不会出现「先闪出旧卡片再消失」。
 另外切回标签页时浏览器半会立刻补拉一次状态，不用等 30 秒的轮询周期。
 
-想立刻手动清掉当前那条：`npx dsh-workbuddy-guard check --clear-watermark`。
+想立刻手动清掉当前那条：`npx dsh-workbuddy-account-care check --clear-watermark`。
 
 ## 工作方式
 
 只有一条定时链，全部在 DSH 进程内：
 
 ```
-dsh-workbuddy-guard（Host 半）
+dsh-workbuddy-account-care（Host 半）
   ├─ 每 3 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
   │     ├─ 读 WorkBuddy 官方接口 /v2/update，取出两路版本号
@@ -327,26 +337,26 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 ## 命令
 
 ```bash
-npx dsh-workbuddy-guard status    # 守卫状态：版本、启用与否、水印、检查次数
-npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
-npx dsh-workbuddy-guard check     # 立刻跑一次检查
+npx dsh-workbuddy-account-care status    # 守卫状态：版本、启用与否、水印、检查次数
+npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
+npx dsh-workbuddy-account-care check     # 立刻跑一次检查
 ```
 
 `check` 可透传：
 
 ```bash
-npx dsh-workbuddy-guard check --dry-run            # 演练，不落盘
-npx dsh-workbuddy-guard check --check              # 只检查，绝不改 profile
-npx dsh-workbuddy-guard check --enable             # 恢复被停用的插件
-npx dsh-workbuddy-guard check --clear-watermark    # 只清界面水印
-npx dsh-workbuddy-guard check --no-upgrade         # 跳过自动升级
-npx dsh-workbuddy-guard check --status             # 机器可读 JSON
+npx dsh-workbuddy-account-care check --dry-run            # 演练，不落盘
+npx dsh-workbuddy-account-care check --check              # 只检查，绝不改 profile
+npx dsh-workbuddy-account-care check --enable             # 恢复被停用的插件
+npx dsh-workbuddy-account-care check --clear-watermark    # 只清界面水印
+npx dsh-workbuddy-account-care check --no-upgrade         # 跳过自动升级
+npx dsh-workbuddy-account-care check --status             # 机器可读 JSON
 ```
 
 也可以直接跑脚本：
 
 ```bash
-node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
+node node_modules/dsh-workbuddy-account-care/scripts/watch.mjs
 ```
 
 ## 配置
@@ -354,8 +364,8 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 在 profile 的 `cordis.patch.yml` 里覆盖，改完重启 DSH：
 
 ```yaml
-- id: dsh-workbuddy-guard
-  name: dsh-workbuddy-guard
+- id: dsh-workbuddy-account-care
+  name: dsh-workbuddy-account-care
   config:
     intervalMinutes: 3      # 内置定时间隔，分钟
     selfSchedule: true      # false = 关掉内置定时（此时不会有任何自动检查）

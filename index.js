@@ -1,5 +1,5 @@
 /**
- * WorkBuddy 版本守卫 —— Host 半。
+ * dsh-workbuddy 账号呵护 —— Host 半。
  *
  * 三件事，全部由脚本（`scripts/watch.mjs`）写下的指令文件驱动：
  *
@@ -26,7 +26,7 @@
  *
  * 代价也要说清楚：默认「插件自带定时」，所以 **DSH 不在跑的时候不检查**。
  * 这在语义上是够的——DSH 没跑就没有任何请求会被发出去。若你仍想要「DSH 关了
- * 也守着」，把 systemd 定时器也装上即可（`npx dsh-workbuddy-guard install`），
+ * 也守着」，把 systemd 定时器也装上即可（`npx dsh-workbuddy-account-care install`），
  * 两边有 `run.lock` 互斥，不会同时写。
  *
  * 状态文件（默认 `$DSH_HOME/workbuddy-update-watch/guard.json`，脚本写入）：
@@ -77,9 +77,9 @@ const WATCH_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'w
 const DEFAULT_INTERVAL_MINUTES = 3
 
 /** 供浏览器半读取的水印/状态端点。 */
-const STATE_PATH = '/plugins/dsh-workbuddy-guard/state'
+const STATE_PATH = '/plugins/dsh-workbuddy-account-care/state'
 /** 界面按钮的动作端点（软结束 / 硬结束）。 */
-const ACTION_PATH = '/plugins/dsh-workbuddy-guard/action'
+const ACTION_PATH = '/plugins/dsh-workbuddy-account-care/action'
 /** 软结束之后等会话自己停下来的上限；超时也照样停用，只是把结果记进日志。 */
 const SOFT_WAIT_MS = 120_000
 
@@ -265,7 +265,7 @@ function softStop(agent, reason, text) {
   return model
 }
 
-export const name = 'dsh-workbuddy-guard'
+export const name = 'dsh-workbuddy-account-care'
 
 /**
  * 这些服务缺失时插件保持惰性，而不是把整个 profile 弄挂。

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * WorkBuddy 版本守卫 (WorkBuddy Update Watch)
+ * dsh-workbuddy 账号呵护 (WorkBuddy Account Care)
  * ---------------------------------------------------------------------------
  * 每 3 分钟问一次 WorkBuddy 官方的版本接口。只要接口给的版本号和本地记录的
  * 基点版本号对不上，就认为「客户端已经更新」，于是挂水印 / 停用 bundle
@@ -37,7 +37,7 @@
  *   - 升级后在界面挂「插件已升级，重启生效」水印
  *
  * 界面联动：写 `guard.json`（指令文件），由已安装的 bundle
- * `dsh-workbuddy-guard` 读取：
+ * `dsh-workbuddy-account-care` 读取：
  *   - `watermark`     → 浏览器半在 shell.overlay 里画水印
  *   - `stopSessions`  → Host 半软结束「正在跑且在用 workbuddy」的会话
  * 停用 bundle 这件事**只由本脚本做**，插件不做——本插件加载失败时脚本照样
@@ -149,7 +149,7 @@ const DISABLE_ON_UPSTREAM = flag('--disable-on-upstream')
 const STATE_FILE = join(STATE, 'state.json')
 const CONFIG_FILE = join(STATE, 'config.json')
 const LOG_FILE = join(STATE, 'watch.log')
-/** 给 dsh-workbuddy-guard 的指令文件。 */
+/** 给 dsh-workbuddy-account-care 的指令文件。 */
 const GUARD_FILE = join(STATE, 'guard.json')
 /** 互斥锁：systemd 定时器与 DSH 内的自动任务可能同一时刻触发。 */
 const LOCK_FILE = join(STATE, 'run.lock')
@@ -626,7 +626,7 @@ function upgradePlugin(targetVersion, { dryRun }) {
 }
 
 // ---------------------------------------------------------------------------
-// 指令文件（与 dsh-workbuddy-guard 的契约）
+// 指令文件（与 dsh-workbuddy-account-care 的契约）
 // ---------------------------------------------------------------------------
 
 function readGuardFile() {
@@ -699,7 +699,7 @@ function notify(title, body) {
     }
     const notifySend = ['/usr/bin/notify-send', '/usr/local/bin/notify-send'].find((p) => existsSync(p))
     if (notifySend === undefined) return false
-    execFileSync(notifySend, ['-a', 'WorkBuddy 版本守卫', '-u', 'critical', '-t', '0', title, body], {
+    execFileSync(notifySend, ['-a', 'dsh-workbuddy 账号呵护', '-u', 'critical', '-t', '0', title, body], {
       stdio: 'ignore', timeout: 5000,
       env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' },
     })

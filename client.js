@@ -1,8 +1,8 @@
 /**
- * WorkBuddy 版本守卫 —— 浏览器半。
+ * dsh-workbuddy 账号呵护 —— 浏览器半。
  *
  * 只做两件事：
- *   1. 从 Host 的 `/plugins/dsh-workbuddy-guard/state` 取「当前该不该有水印、写什么」；
+ *   1. 从 Host 的 `/plugins/dsh-workbuddy-account-care/state` 取「当前该不该有水印、写什么」；
  *   2. 自己判断「现在有没有 workbuddy 会话在跑」，只有跑着的时候才把水印画出来。
  *
  * 为什么第 2 件事放在浏览器而不是 Host：`running` 是会话级的瞬时状态，Host 每 15 秒
@@ -36,20 +36,20 @@
  *   渲染，不做任何「猜它该不该过期」的判断。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-workbuddy-guard',
+  id: 'dsh-workbuddy-account-care',
   factory(require) {
     const React = require('react')
     const h = React.createElement
 
-    const STATE_URL = '/plugins/dsh-workbuddy-guard/state'
+    const STATE_URL = '/plugins/dsh-workbuddy-account-care/state'
     const POLL_MS = 30_000
-    const STYLE_ID = 'dsh-workbuddy-guard:styles'
+    const STYLE_ID = 'dsh-workbuddy-account-care:styles'
     /** 退场动画时长；到点再真正卸载卡片。 */
     const LEAVE_MS = 180
     /** 「知道了」之后隔多久重新浮出来（前提：仍有 workbuddy 会话在跑）。 */
     const RESHOW_MS = 1800
     /** 用户在这里选「软结束 / 硬结束」时打到 Host 的端点。 */
-    const ACTION_URL = '/plugins/dsh-workbuddy-guard/action'
+    const ACTION_URL = '/plugins/dsh-workbuddy-account-care/action'
     /** 被守卫的 provider 前缀，与 index.js 的 GUARDED_PROVIDERS 保持一致。 */
     const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
 
@@ -515,7 +515,7 @@ window.__ModuleLoader__.load({
         clientSessions = ctx.get('sessions')
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
-          id: 'dsh-workbuddy-guard',
+          id: 'dsh-workbuddy-account-care',
           order: 100,
         }, () => h(Watermark, { sessions: clientSessions })))
       },

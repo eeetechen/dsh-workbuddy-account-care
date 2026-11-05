@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * dsh-workbuddy-guard —— 命令行工具。
+ * dsh-workbuddy-account-care —— 命令行工具。
  *
  * 定时**只有一条**：bundle 自己（`index.js` 的 `selfSchedule`）每 3 分钟派生一次
  * `scripts/watch.mjs`。这里没有 install/uninstall，因为不需要再挂第二个定时器
  * —— DSH 没在跑的时候，也没有任何请求会被发出去，那时检查没有意义。
  *
  * 本文件只提供手动操作与排查：
- *   dsh-workbuddy-guard status            # 守卫状态
- *   dsh-workbuddy-guard where             # 解析出的各条路径
- *   dsh-workbuddy-guard check [args...]   # 立刻跑一次（参数透传给 watch.mjs）
+ *   dsh-workbuddy-account-care status            # 守卫状态
+ *   dsh-workbuddy-account-care where             # 解析出的各条路径
+ *   dsh-workbuddy-account-care check [args...]   # 立刻跑一次（参数透传给 watch.mjs）
  *
  * 透传的常用参数：
  *   --dry-run              演练，不落盘
@@ -37,7 +37,7 @@ const ARGV = process.argv.slice(2)
 const cmd = ARGV[0] ?? 'status'
 
 const say = (msg) => process.stdout.write(`${msg}\n`)
-const warn = (msg) => process.stderr.write(`dsh-workbuddy-guard: ${msg}\n`)
+const warn = (msg) => process.stderr.write(`dsh-workbuddy-account-care: ${msg}\n`)
 
 /** 跑一次检查脚本，返回解析后的 JSON（解析失败则给原始输出）。 */
 function runWatch(extra = []) {
