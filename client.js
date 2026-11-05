@@ -48,6 +48,8 @@ window.__ModuleLoader__.load({
     const LEAVE_MS = 180
     /** 「知道了」之后隔多久重新浮出来（前提：仍有 workbuddy 会话在跑）。 */
     const RESHOW_MS = 1800
+    /** 用户在这里选「软结束 / 硬结束」时打到 Host 的端点。 */
+    const ACTION_URL = '/plugins/dsh-workbuddy-guard/action'
     /** 被守卫的 provider 前缀，与 index.js 的 GUARDED_PROVIDERS 保持一致。 */
     const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
 
@@ -154,6 +156,13 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-tertiary, #777777);
   font-variant-numeric: tabular-nums;
 }
+.dsh-wbg-actions {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+}
 .dsh-wbg-btn {
   flex: none;
   border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, .12));
@@ -175,6 +184,26 @@ window.__ModuleLoader__.load({
 .dsh-wbg-btn:focus-visible {
   outline: 2px solid var(--wbg-accent);
   outline-offset: 2px;
+}
+.dsh-wbg-btn:disabled {
+  opacity: .55;
+  cursor: default;
+}
+/* 软结束：描边强调，不填色——它只是「排一条消息」 */
+.dsh-wbg-btn--soft {
+  border-color: color-mix(in srgb, var(--wbg-accent) 55%, transparent);
+  color: var(--wbg-accent);
+}
+/* 硬结束：填色强调——它会立刻打断正在跑的会话 */
+.dsh-wbg-btn--hard {
+  background: var(--wbg-accent);
+  border-color: var(--wbg-accent);
+  color: #ffffff;
+}
+.dsh-wbg-btn--hard:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--wbg-accent) 82%, var(--dsw-alias-label-primary, #111111));
+  border-color: var(--wbg-accent);
+  color: #ffffff;
 }
 @keyframes dsh-wbg-rise {
   from { opacity: 0; transform: translateY(-14px) scale(.97); filter: blur(6px); }
@@ -298,9 +327,17 @@ window.__ModuleLoader__.load({
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
       const inUse = useWorkbuddyInUse(sessions)
+      /** 这条是「等你决定」的提示（带软结束/硬结束按钮），不受 provider 门控。 */
+      const pending = watermark?.pendingDisable === true
 
       /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
       const [snoozedRevision, setSnoozedRevision] = React.useState(null)
+      /** 正在执行的动作（soft/hard/ack）；非 null 时按钮全部禁用。 */
+      const [busy, setBusy] = React.useState(null)
+      /** 动作失败的原因，直接显示在卡片里。 */
+      const [failed, setFailed] = React.useState(null)
+      /** 动作已成功 → 立刻收起，不等下一轮轮询。 */
+      const [finished, setFinished] = React.useState(false)
       const [leaving, setLeaving] = React.useState(false)
       const leaveTimer = React.useRef()
       const reshowTimer = React.useRef()
@@ -310,8 +347,8 @@ window.__ModuleLoader__.load({
 
       // 没有 workbuddy 会话在跑了 → 解除收起，下次再跑起来时重新提示
       React.useEffect(() => {
-        if (!inUse && snoozed) setSnoozedRevision(null)
-      }, [inUse, snoozed])
+        if (!inUse && !pending && snoozed) setSnoozedRevision(null)
+      }, [inUse, pending, snoozed])
 
       // revision 变了（插件更新）→ 一切复位，重新播入场动画
       React.useEffect(() => {
@@ -326,7 +363,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { ensureStyles() }, [])
 
-      const visible = watermark !== null && inUse && !snoozed
+      const visible = watermark !== null && (pending || inUse) && !snoozed && !finished
       if (!visible) return null
 
       const accent = accentFor(watermark.level)
@@ -350,19 +387,53 @@ window.__ModuleLoader__.load({
         leaveTimer.current = setTimeout(() => {
           setSnoozedRevision(revision)
           setLeaving(false)
-          // 还有会话在跑 → 过一会儿重新浮出来；没有就不排这一班车
+          // 还有会话在跑 / 还在等决定 → 过一会儿重新浮出来
           reshowTimer.current = setTimeout(() => {
             setSnoozedRevision((current) => (current === revision ? null : current))
           }, RESHOW_MS)
         }, LEAVE_MS)
       }
 
+      /**
+       * 软结束 / 硬结束。
+       *
+       * 这两个动作会真的改 profile，所以按钮在请求期间全部禁用，避免连点。
+       * 成功后 Host 会把待确认水印清掉，本地也立刻收起，不用等下一轮轮询。
+       */
+      const runAction = async (action) => {
+        if (busy !== null) return
+        if (action === 'ack') { onDismiss(); return }
+        setBusy(action)
+        setFailed(null)
+        try {
+          const res = await fetch(ACTION_URL, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ action }),
+          })
+          const payload = await res.json().catch(() => ({}))
+          if (!res.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${res.status}`)
+          setFinished(true)
+        } catch (error) {
+          setFailed(String(error?.message ?? error))
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const actions = Array.isArray(watermark.actions) ? watermark.actions : []
+      const canSoft = actions.includes('soft')
+      const canHard = actions.includes('hard')
+      const label = (action, idle, running) => (busy === action ? running : idle)
+
       return h('div', { className: 'dsh-wbg-root' }, h('div', {
         className: leaving ? 'dsh-wbg-card dsh-wbg-leaving' : 'dsh-wbg-card',
         role: 'status',
         'aria-live': 'polite',
         style: vars,
-      }, h('div', { className: 'dsh-wbg-rail' }), h('div', { className: 'dsh-wbg-body' },
+      },
+      h('div', { className: 'dsh-wbg-rail' }),
+      h('div', { className: 'dsh-wbg-body' },
         h('div', { className: 'dsh-wbg-title' }, watermark.title ?? 'WB 更新了'),
         // 正文里保留换行：脚本写进来的就是带 \n 的一句
         watermark.body
@@ -371,12 +442,37 @@ window.__ModuleLoader__.load({
         watermark.detail
           ? h('div', { className: 'dsh-wbg-detail' }, watermark.detail)
           : null,
-      ), h('button', {
-        type: 'button',
-        className: 'dsh-wbg-btn',
-        onClick: onDismiss,
-        title: '隐藏这条提示（下次版本变化会再次出现）',
-      }, '知道了')))
+        failed === null
+          ? null
+          : h('div', { className: 'dsh-wbg-detail', style: { color: 'var(--wbg-accent)' } }, `操作失败：${failed}`),
+      ),
+      h('div', { className: 'dsh-wbg-actions' },
+        canSoft
+          ? h('button', {
+            type: 'button',
+            className: 'dsh-wbg-btn dsh-wbg-btn--soft',
+            disabled: busy !== null,
+            onClick: () => { void runAction('soft') },
+            title: '给正在跑的会话发一条暂停消息，等它停下来再停用插件',
+          }, label('soft', '软结束', '正在结束…'))
+          : null,
+        canHard
+          ? h('button', {
+            type: 'button',
+            className: 'dsh-wbg-btn dsh-wbg-btn--hard',
+            disabled: busy !== null,
+            onClick: () => { void runAction('hard') },
+            title: '立刻停用 dsh-connect-workbuddy（正在跑的会话会被打断）',
+          }, label('hard', '硬结束', '正在停用…'))
+          : null,
+        h('button', {
+          type: 'button',
+          className: 'dsh-wbg-btn',
+          disabled: busy !== null,
+          onClick: () => { void runAction('ack') },
+          title: '先收起这条提示（还在用 WorkBuddy 时它会再次出现）',
+        }, '知道了'),
+      )))
     }
 
     /** `sessions` 是可选的：拿不到就退回「只看 guard.json」的老行为，不至于白屏。 */

@@ -133,6 +133,7 @@ const NO_UPGRADE = flag('--no-upgrade')       // 不自动升级插件
 const ASTATUS = flag('--status')
 const ACK = flag('--ack')
 const ENABLE = flag('--enable')               // 把 bundle 重新加回（撤销停用）
+const DISABLE_NOW = flag('--disable')         // 立刻停用（供插件在用户确认后调用）
 const CLEAR_WATERMARK = flag('--clear-watermark')
 const SIMULATE_LOCAL = opt('--simulate-local', null)
 const SIMULATE_PLUGIN = opt('--simulate-plugin', null)
@@ -206,7 +207,7 @@ function releaseLock() {
  * 环境变量 WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM=1 等价于 disableOn: "either"。
  */
 function effectiveConfig() {
-  const defaults = { disableOn: 'local' }
+  const defaults = { disableOn: 'local', autoDisable: false }
   const fromFile = readJson(CONFIG_FILE, {})
   const disableOn = DISABLE_ON_UPSTREAM
     ? 'either'
@@ -214,6 +215,13 @@ function effectiveConfig() {
   const valid = new Set(['local', 'upstream', 'either', 'never'])
   return {
     disableOn: valid.has(disableOn) ? disableOn : defaults.disableOn,
+    /**
+     * 检测到之后要不要**立刻**停用。
+     *
+     * 默认 false：检测到只弹提示，由用户在界面上选「软结束 / 硬结束」。
+     * 置 true 就回到旧行为（自动停用），留给需要无人值守的场景。
+     */
+    autoDisable: fromFile.autoDisable === true,
     configFile: CONFIG_FILE,
     configFileExists: existsSync(CONFIG_FILE),
   }
@@ -852,6 +860,32 @@ async function main() {
     }
     return { mode: 'enable', changed: result.changed, result }
   }
+  /**
+   * `--disable`：**只**停用，不做任何检测。
+   *
+   * 这是给插件用的：用户在界面上点了「软结束」或「硬结束」，Host 半已经处理完
+   * 会话，再派这一点命令把 bundle 摘掉。之所以仍然由脚本写 profile，是为了保持
+   * 「profile 只有一个写者」这条约束（否则插件与脚本会并发改同一个 package.json）。
+   */
+  if (DISABLE_NOW) {
+    const result = disableBundle({ dryRun: DRY_RUN })
+    if (result.changed && !DRY_RUN) {
+      state.disabled = {
+        at: nowIso(),
+        bundle: BUNDLE,
+        reason: 'user-confirmed',
+        from: state.baseline?.display ?? null,
+        to: null,
+        backup: result.backup,
+        restore: `node ${process.argv[1]} --enable   # 或把 "${BUNDLE}" 加回 profile 的 dsh.profile.bundles`,
+      }
+      writeJsonAtomic(STATE_FILE, state)
+      log('warn', `按用户确认停用 ${BUNDLE}（备份 ${result.backup}）`)
+    } else {
+      log('info', `停用请求未做改动: ${result.reason}${result.wouldChange ? '（dry-run）' : ''}`)
+    }
+    return { mode: 'disable', changed: result.changed, result }
+  }
 
   const local = readLocal()
   const simulated = SIMULATE_LOCAL !== null
@@ -976,29 +1010,54 @@ async function main() {
   // 4) 决定要不要停用
   const triggers = events.filter((e) => e.action === 'disable-bundle')
   let disableResult = null
+  let pendingDisable = false
   if (triggers.length > 0 && !MODE_CHECK) {
-    disableResult = disableBundle({ dryRun: DRY_RUN })
-    log(disableResult.changed ? 'warn' : 'info',
-      disableResult.changed
-        ? `已停用 ${BUNDLE}（备份 ${disableResult.backup}）`
-        : `未改动 ${BUNDLE}: ${disableResult.reason}${disableResult.wouldChange ? '（dry-run）' : ''}`)
+    const trigger = triggers[0]
+    if (config.autoDisable) {
+      // 无人值守模式：检测到就当场停用（旧行为）
+      disableResult = disableBundle({ dryRun: DRY_RUN })
+      log(disableResult.changed ? 'warn' : 'info',
+        disableResult.changed
+          ? `已停用 ${BUNDLE}（备份 ${disableResult.backup}）`
+          : `未改动 ${BUNDLE}: ${disableResult.reason}${disableResult.wouldChange ? '（dry-run）' : ''}`)
 
-    // 停用生效的那一刻：挂水印 + 让正在用它的会话软结束
-    if (disableResult.changed) {
-      const trigger = triggers[0]
+      if (disableResult.changed) {
+        updateWatermark({
+          level: 'danger',
+          title: 'WB 更新了',
+          body: '还用，你的账号是批发的吗？',
+          detail: `${trigger.from} → ${trigger.to} · ${BUNDLE} 已停用`,
+        })
+        issueStopSessions(
+          `本机 WorkBuddy 已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,
+          STOP_TEXT,
+          trigger.from,
+          trigger.to,
+        )
+        log('warn', '已写水印与软结束指令，等待 guard 插件下发到界面与会话')
+      }
+    } else {
+      /**
+       * 默认路径：**只报警，不动手**。
+       *
+       * 检测到本机 WB 变了，把「该停用了」这件事写进水印，由用户在界面上选
+       * 「软结束」或「硬结束」。守卫不再替用户决定什么时候掐断他的会话——
+       * 一个正在跑的任务被自动中止，比晚几秒停用糟糕得多。
+       *
+       * 水印上带 `pendingDisable` 与 `actions`，浏览器半据此画出三个按钮。
+       */
+      pendingDisable = true
       updateWatermark({
         level: 'danger',
         title: 'WB 更新了',
-        body: '还用，你的账号是批发的吗？',
-        detail: `${trigger.from} → ${trigger.to} · ${BUNDLE} 已停用`,
+        body: '还能用，但私有接口可能已经变了。选一个结束方式。',
+        detail: `${trigger.from} → ${trigger.to}`,
+        pendingDisable: true,
+        actions: ['soft', 'hard'],
+        from: trigger.from,
+        to: trigger.to,
       })
-      issueStopSessions(
-        `本机 WorkBuddy 已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,
-        STOP_TEXT,
-        trigger.from,
-        trigger.to,
-      )
-      log('warn', '已写水印与软结束指令，等待 guard 插件下发到界面与会话')
+      log('warn', `检测到本机 WorkBuddy 更新（${trigger.from} → ${trigger.to}），已挂提示，等待用户选择软结束/硬结束`)
     }
   } else if (triggers.length > 0 && MODE_CHECK) {
     log('info', `--check 模式：命中 ${triggers.length} 个停用条件，但不修改 profile`)
@@ -1076,8 +1135,11 @@ async function main() {
     log('info', `检查 #${state.checks}：本机 ${local.display}，上游 ${upstream.ok ? upstream.version : `读取失败(${upstream.error})`}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
   }
 
-  // 5) 通知（只在真的停用、或明确要求播报上游新版时弹）
-  if (disableResult?.changed) {
+  // 5) 通知（只在真的停用、待用户确认、或明确要求播报上游新版时弹）
+  if (pendingDisable) {
+    notify('WorkBuddy 更新了 —— 等待你选择',
+      `${triggers[0].from} → ${triggers[0].to}\n插件还在运行；到界面上选「软结束」或「硬结束」。`)
+  } else if (disableResult?.changed) {
     notify('WorkBuddy 已更新 —— 插件已停用',
       `${triggers[0].from} → ${triggers[0].to}\n已停用 ${BUNDLE}；界面已挂水印，正在用它的会话已被软结束。\n恢复：node ${process.argv[1]} --enable`)
   } else if (pluginUpgrade?.upgraded) {
@@ -1114,6 +1176,7 @@ async function main() {
     events,
     changed: events.length > 0,
     disabled: disableResult?.changed ?? false,
+    pendingDisable,
     disableResult,
     bundleSelected: bundleSelected(),
     pendingReport: (state.pendingReport ?? []).length,

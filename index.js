@@ -1,12 +1,15 @@
 /**
  * WorkBuddy 版本守卫 —— Host 半。
  *
- * 两件事，全部由外部定时任务（`~/.dsh/scripts/workbuddy-update-watch.mjs`）
- * 写下的一个指令文件驱动：
+ * 三件事，全部由脚本（`scripts/watch.mjs`）写下的指令文件驱动：
  *
- *   1. 正在跑、且正在用 workbuddy provider 的会话 → 软结束（cancel 当前轮，
- *      并用 followup 送一条「暂停执行，等待重启 agent 工具」）
- *   2. 把「水印」这一状态发布给浏览器半，由它在 shell.overlay 里画出来
+ *   1. 把「水印」这一状态发布给浏览器半，由它在 shell.overlay 里画出来；
+ *   2. 检测到更新后**不自动停用**：挂一张带「软结束 / 硬结束」的提示，等用户选；
+ *   3. 用户选了之后执行动作（软结束 = 先让会话停，硬结束 = 直接停用），
+ *      再由脚本把 bundle 从 profile 里摘掉。
+ *
+ * 为什么默认不再自动停用：一个正在跑的任务被自动中止，代价比晚几秒停用大得多。
+ * 需要无人值守的场景把 `config.json` 的 `autoDisable` 设成 true 即可回到旧行为。
  *
  * **谁在定时**：本插件自己。它每隔 `intervalMinutes`（默认 3）派生一次包内的
  * `scripts/watch.mjs`，后者做检测、停用与升级，并把结果写成下面这个指令文件；
@@ -75,6 +78,10 @@ const DEFAULT_INTERVAL_MINUTES = 3
 
 /** 供浏览器半读取的水印/状态端点。 */
 const STATE_PATH = '/plugins/dsh-workbuddy-guard/state'
+/** 界面按钮的动作端点（软结束 / 硬结束）。 */
+const ACTION_PATH = '/plugins/dsh-workbuddy-guard/action'
+/** 软结束之后等会话自己停下来的上限；超时也照样停用，只是把结果记进日志。 */
+const SOFT_WAIT_MS = 120_000
 
 function resolveDshHome() {
   return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
@@ -297,6 +304,143 @@ export function apply(ctx, config = {}) {
       }))
     },
   }), 'workbuddy-guard: state route')
+
+  // ---- 动作端点：界面上「软结束 / 硬结束」走这里 -------------------------
+  /**
+   * 这里只做三件事，都很短：软结束时先让会话停，硬结束时直接停用，最后清掉待确认水印。
+   *
+   * 为什么停用仍然由脚本做：写 profile 的 `package.json` 只能有一个写者，
+   * 脚本与插件并发改同一个文件会写出半成品。插件负责「判断与调度」，脚本负责「落盘」。
+   */
+  let actionInFlight = null
+
+  async function waitForWorkbuddyIdle(timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const agents = ctx.agents?.list?.() ?? []
+      const busy = agents.filter((agent) => {
+        if (agent.status !== 'running') return false
+        try {
+          const projections = ctx.get('sessionProjections')?.snapshot(agent.session)?.values
+          return usesWorkbuddy(agent, projections) !== null
+        } catch { return false }
+      })
+      if (busy.length === 0) return { idle: true, waitedMs: timeoutMs - (deadline - Date.now()) }
+      if (Date.now() >= deadline) return { idle: false, remaining: busy.map((a) => a.id) }
+      await new Promise((resolve) => { const t = setTimeout(resolve, 1000); t.unref?.() })
+    }
+  }
+
+  /** 派脚本停用 bundle（`--disable` 只停用、不检测）。 */
+  function disableCurrentBundle() {
+    return new Promise((resolve) => {
+      const args = [WATCH_SCRIPT, '--disable']
+      const profile = config.profile ?? process.env.DSH_PROFILE
+      if (typeof profile === 'string' && profile !== '') args.push('--profile', profile)
+      let child
+      try {
+        child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (error) {
+        resolve({ ok: false, error: String(error?.message || error) })
+        return
+      }
+      let stdout = ''
+      let stderr = ''
+      child.stdout?.on('data', (chunk) => { stdout += String(chunk) })
+      child.stderr?.on('data', (chunk) => { stderr += String(chunk) })
+      child.on('error', (error) => resolve({ ok: false, error: String(error?.message || error) }))
+      child.on('close', (code) => {
+        const line = stdout.trim().split('\n').filter(Boolean).pop()
+        let parsed
+        try { parsed = JSON.parse(line) } catch { parsed = undefined }
+        resolve({ ok: code === 0, code, result: parsed, stderr: stderr.trim().slice(0, 400) })
+      })
+    })
+  }
+
+  /** 清掉「待确认」水印，并让浏览器半立刻看到。 */
+  async function clearPendingWatermark(file) {
+    let snapshot
+    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return null }
+    snapshot.watermark = null
+    snapshot.revision = (Number(snapshot.revision) || 0) + 1
+    snapshot.actionAt = new Date().toISOString()
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+    await rename(tmp, file)
+    publishedWatermarkRevision = snapshot.revision
+    current = { watermark: null, revision: snapshot.revision, guardFile: file }
+    return snapshot.revision
+  }
+
+  async function runAction(action) {
+    const state = await readGuardState()
+    const wm = state.watermark ?? {}
+    const from = wm.from ?? '?'
+    const to = wm.to ?? '?'
+    const reason = `本机 WorkBuddy 已更新（${from} → ${to}）`
+
+    let stopped = []
+    let idle = null
+    if (action === 'soft') {
+      // 先把消息送出去让会话停，再等它真的停下来
+      try {
+        stopped = stopWorkbuddySessions(reason, DEFAULT_STOP_TEXT).stopped
+      } catch (error) {
+        logger.error?.(`[workbuddy-guard] 软结束失败: ${error?.message || error}`)
+      }
+      idle = await waitForWorkbuddyIdle(SOFT_WAIT_MS)
+      logger.warn?.(`[workbuddy-guard] 软结束：停止 ${stopped.length} 个会话，idle=${idle.idle}`)
+    }
+
+    const disabled = await disableCurrentBundle()
+    if (!disabled.ok) logger.error?.(`[workbuddy-guard] 停用失败: ${disabled.error ?? disabled.stderr ?? disabled.code}`)
+    await clearPendingWatermark(state.file)
+    logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：disabled=${disabled.ok}`)
+    return { stopped, idle, disabled }
+  }
+
+  async function handleAction(req, res) {
+    const send = (status, payload) => {
+      res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      res.end(JSON.stringify(payload))
+    }
+    if (req.method !== 'POST') return send(405, { ok: false, error: 'method-not-allowed' })
+    let raw = ''
+    try {
+      for await (const chunk of req) {
+        raw += chunk
+        if (raw.length > 4096) throw new Error('body-too-large')
+      }
+    } catch (error) {
+      return send(400, { ok: false, error: String(error?.message || error) })
+    }
+    let body = {}
+    try { body = raw === '' ? {} : JSON.parse(raw) } catch { return send(400, { ok: false, error: 'bad-json' }) }
+    const action = body.action
+    if (action === 'ack') return send(200, { ok: true, action })
+    if (action !== 'soft' && action !== 'hard') return send(400, { ok: false, error: 'unknown-action' })
+    if (actionInFlight !== null) return send(409, { ok: false, error: 'busy', action: actionInFlight })
+    actionInFlight = action
+    try {
+      const result = await runAction(action)
+      return send(200, { ok: true, action, ...result })
+    } catch (error) {
+      logger.error?.(`[workbuddy-guard] 动作 ${action} 失败: ${error?.message || error}`)
+      return send(500, { ok: false, action, error: String(error?.message || error) })
+    } finally {
+      actionInFlight = null
+    }
+  }
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ACTION_PATH,
+    handler: (req, res) => { void handleAction(req, res) },
+  }), 'workbuddy-guard: action route')
 
   // ---- 上一个进程留下的「重启生效」水印：第一次 poll 前清掉 -------------
   /**
