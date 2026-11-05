@@ -234,59 +234,70 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 有没有「正在跑的 workbuddy 会话」。
+     * 「现在是不是在用 workbuddy」，两个来源任一命中即算：
      *
-     * 数据直接来自浏览器的会话列表：`running` 是 Host 给的实时状态，
-     * `projectionValues.modelSelection` 是该会话当前的 provider。两者都是现成的，
-     * 不需要再向 Host 要一个专用接口，也不需要等 15 秒的文件轮询。
+     *   1. **当前正在看的会话**（`retainedBy.mainView`）**选中**的 provider 是 workbuddy 系
+     *      —— 这一条让水印在「刚在菜单里点下 WorkBuddy 模型」的瞬间就浮出来，
+     *      不用等发送。`modelSelection.next` 就是 `pending ?? lastUsed`，用户点选会先写
+     *      `model/selection` 事件，投影立刻变，浏览器这边一个订阅就收到了。
+     *   2. **任何正在跑（running）的会话**用的是 workbuddy 系 —— 后台跑着的会话也算。
      *
-     * `next` 优先于 `lastUsed`：刚切过去还没发消息时，`next` 才是「你现在打算用谁」。
+     * 为什么只对「当前会话」看选中值、对「其它会话」要求 running：
+     * 历史会话的 `lastUsed` 会长期保留 workbuddy，如果对全部会话都只看选中值，
+     * 那么只要曾经用过一次 WorkBuddy，水印就会永远亮着——那正是要修掉的问题。
      */
-    function useGuardedSessionsRunning(sessions) {
-      // 拿不到会话服务 → 不知道谁在跑，退回「保守显示」，别让守卫静默失效
-      const [running, setRunning] = React.useState(sessions === undefined || sessions === null)
+    function useWorkbuddyInUse(sessions) {
+      // 拿不到会话服务 → 不知道谁在用，退回「保守显示」，别让守卫静默失效
+      const [inUse, setInUse] = React.useState(sessions === undefined || sessions === null)
       React.useEffect(() => {
         if (sessions === undefined || sessions === null) return
+        const guarded = (row) => {
+          const selection = row?.projectionValues?.modelSelection
+          const pick = selection?.next ?? selection?.lastUsed
+          return pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)
+        }
         const read = () => {
           let found = false
           try {
             const snap = sessions.list.getSnapshot()
-            for (const id of snap.ids) {
-              const row = snap.byId[id]
-              if (row === undefined || row.running !== true) continue
-              const selection = row.projectionValues?.modelSelection
-              const pick = selection?.next ?? selection?.lastUsed
-              if (pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)) {
-                found = true
-                break
+            // 1) 当前会话：选中即提示（刚切过去、还没发送也算）
+            const main = Object.values(snap.byId).find((row) => (row.retainedBy?.mainView ?? 0) > 0)
+            if (main !== undefined && guarded(main)) found = true
+            // 2) 后台正在跑的会话
+            if (!found) {
+              for (const id of snap.ids) {
+                const row = snap.byId[id]
+                if (row === undefined || row.running !== true) continue
+                if (guarded(row)) { found = true; break }
               }
             }
           } catch { found = false }
-          setRunning(found)
+          setInUse(found)
         }
         read()
         return sessions.list.subscribe(read)
       }, [sessions])
-      return running
+      return inUse
     }
 
     /**
      * 水印的显示状态机。
      *
      * 规则（用户约定）：
-     *   - 有 workbuddy 会话在跑 → 显示；没有 → 不显示（哪怕 guard.json 里还留着内容）；
-     *   - 「知道了」只是收起来一会儿：只要还有 workbuddy 会话在跑，`RESHOW_MS` 后
-     *     带入场动画重新浮出；等没有会话在跑时点，就安静地不再冒出来；
+     *   - 正在用 workbuddy（当前会话选中它，或有会话在跑）→ 显示；
+     *     没有 → 不显示（哪怕 guard.json 里还留着内容）；
+     *   - 「知道了」只是收起来一会儿：还在用就 `RESHOW_MS` 后带入场动画重新浮出；
+     *     已经切走 / 没会话在跑，就安静地不再冒出来；
      *   - revision 变化（workbuddy-connect 更新）是复位点。
      *
      * 也就是说，**「知道了」不会永久关掉一个正在发生的风险**，它只负责把眼前这块
-     * 玻璃收走一秒半。真正让它停下来的，是风险本身消失（没有 workbuddy 会话在跑）。
+     * 玻璃收走一秒半。真正让它停下来的，是风险本身消失（切走 provider 或停跑）。
      */
     function Watermark({ sessions }) {
       const state = useGuardState()
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
-      const running = useGuardedSessionsRunning(sessions)
+      const inUse = useWorkbuddyInUse(sessions)
 
       /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
       const [snoozedRevision, setSnoozedRevision] = React.useState(null)
@@ -299,8 +310,8 @@ window.__ModuleLoader__.load({
 
       // 没有 workbuddy 会话在跑了 → 解除收起，下次再跑起来时重新提示
       React.useEffect(() => {
-        if (!running && snoozed) setSnoozedRevision(null)
-      }, [running, snoozed])
+        if (!inUse && snoozed) setSnoozedRevision(null)
+      }, [inUse, snoozed])
 
       // revision 变了（插件更新）→ 一切复位，重新播入场动画
       React.useEffect(() => {
@@ -315,7 +326,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { ensureStyles() }, [])
 
-      const visible = watermark !== null && running && !snoozed
+      const visible = watermark !== null && inUse && !snoozed
       if (!visible) return null
 
       const accent = accentFor(watermark.level)

@@ -102,29 +102,33 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 - 容器 `pointer-events: none`，不吃点击，不挡对话。
 - 颜色跟随主题令牌（`--dsw-alias-*`），亮/暗自动适配；`prefers-reduced-motion` 时动画全关。
 
-### 水印跟随 provider：只在真的用 WorkBuddy 时出现
+### 水印跟随 provider：切模型的那一刻就出现
 
-水印**不再是无条件常驻**。它只在下面这个条件成立时才会画出来：
+水印**不再是无条件常驻**，也不会等到你按下发送才出现。下面任一条件成立就画出来：
 
-> **此刻有一个 `running` 的会话，且它的 provider 是 workbuddy 系。**
+> 1. **当前正在看的会话**（`retainedBy.mainView`）**选中**的 provider 是 workbuddy 系；
+> 2. 任何**正在运行**（`running`）的会话用的是 workbuddy 系。
 
-判断放在浏览器半（`client.js`），因为它直接订阅着会话列表：`running` 和
-`projectionValues.modelSelection` 都是现成的实时值，切 provider、开跑、停跑
-立刻就有反应，不用等 Host 那 15 秒的文件轮询。
-
-于是你会看到：
+第 1 条就是「切模型即提示」：在模型菜单里点下 WorkBuddy 的模型，**还没发送**，
+水印就已经浮出来了。这条能成立，是因为 `modelSelection` 投影的 `next` 是
+`pending ?? lastUsed`——点选先写 `model/selection` 事件，投影立刻变，浏览器这边
+的订阅一个帧内就收到，不用等下一轮对话。
 
 | 操作 | 水印 |
 |---|---|
-| 选中 WorkBuddy 模型并发起一轮 | 浮出来（红色 / 橙色，看级别） |
-| 这一轮结束，没有别的 workbuddy 会话在跑 | 收回去 |
-| 切到 DeepSeek 等其它 provider | 不显示 |
+| 在模型菜单里选中 WorkBuddy 模型（未发送） | **立即浮出**（红色 / 橙色，看级别） |
+| 切回 DeepSeek 等其它 provider | 立即收回 |
+| 后台有 workbuddy 会话在跑 | 保持显示 |
 | 插件被停用、你强开 `dsh-connect-workbuddy` 继续用 | 再次浮出来 |
+
+为什么「当前会话看选中值、其它会话要求 running」：历史会话的 `lastUsed` 会长期
+保留 workbuddy，若对所有会话都只看选中值，只要用过一次 WorkBuddy，水印就会永远
+亮着——那正是要修掉的问题。
 
 **「知道了」不会永久关掉一个正在发生的风险。** 它只把眼前这块玻璃收起来：
 
-- 还有 workbuddy 会话在跑 → 1.8 秒后带入场动画重新浮出（先消失、再出现）；
-- 已经没有会话在跑 → 安静地不再冒出来；
+- 还在用 workbuddy（选中或在跑）→ 1.8 秒后带入场动画重新浮出（先消失、再出现）；
+- 已经切走 / 没有会话在跑 → 安静地不再冒出来；
 - workbuddy-connect 更新（`revision` 变化）→ 一切复位。
 
 这样做的理由很直接：一个「你正在用它、而它可能已经坏了」的提示，被一次点击永久
