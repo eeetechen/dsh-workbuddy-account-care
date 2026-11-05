@@ -62,14 +62,14 @@ function cmdStatus() {
   }
   const v = r.value
   if (v.targetInstalled === false) {
-    say(`WorkBuddy   ${v.local}`)
     say(`guard pkg   (not installed)`)
     say(`status      SKIPPED — dsh-connect-workbuddy 未安装，守卫不做任何事`)
     say(`evidence    ${v.targetEvidence}`)
     say(`state dir   ${STATE_DIR}`)
     process.exit(0)
   }
-  say(`WorkBuddy   ${v.local}`)
+  say(`baseline    ${v.baselineVersion ?? '(none — 下一轮自动落基线)'}${v.baselineAt ? `  @ ${v.baselineAt}` : ''}`)
+  say(`source      ${v.upstreamUrl ?? '(default)'}`)
   say(`guard pkg   ${v.pluginInstalled ?? '(not installed)'}`)
   say(`plugin on   ${v.bundleSelected === true ? 'yes' : v.bundleSelected === false ? 'NO (disabled)' : 'unknown'}`)
   say(`watermark   ${v.watermark ? v.watermark.title : 'none'}`)

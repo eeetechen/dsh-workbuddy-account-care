@@ -394,7 +394,7 @@ export function apply(ctx, config = {}) {
     const wm = state.watermark ?? {}
     const from = wm.from ?? '?'
     const to = wm.to ?? '?'
-    const reason = `本机 WorkBuddy 已更新（${from} → ${to}）`
+    const reason = `WorkBuddy 版本与基线不一致（${from} → ${to}）`
 
     let stopped = []
     let idle = null
@@ -550,7 +550,7 @@ export function apply(ctx, config = {}) {
     // 2) 软结束会话：指令里带 stopSessions 就执行一次（幂等）
     const stop = state.stopSessions
     if (stop && Number(stop.revision) > handledStopRevision && !stop.handled) {
-      const reason = String(stop.reason || '本机 WorkBuddy 已更新')
+      const reason = String(stop.reason || 'WorkBuddy 版本与基线不一致')
       const text = String(stop.text || DEFAULT_STOP_TEXT)
       let sessions = { stopped: [], skipped: [] }
       let failure = null

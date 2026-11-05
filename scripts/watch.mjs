@@ -2,24 +2,25 @@
 /**
  * WorkBuddy 版本守卫 (WorkBuddy Update Watch)
  * ---------------------------------------------------------------------------
- * 每 3 分钟检查一次「本机 WorkBuddy 桌面端」有没有被更新，一旦发现更新就
- * 在 DSH profile 里停用 bundle `dsh-connect-workbuddy`，并弹一条桌面通知。
+ * 每 3 分钟问一次 WorkBuddy 官方的版本接口。只要接口给的版本号和本地记录的
+ * 基点版本号对不上，就认为「客户端已经更新」，于是挂水印 / 停用 bundle
+ * `dsh-connect-workbuddy` / 弹桌面通知。
  *
- * 为什么是「本机」而不是只看上游：
- *   dsh-connect-workbuddy 依赖的是本机 WorkBuddy 客户端的私有接口与凭据文件。
- *   上游发布了新版本、而本机没升级时，插件仍然是好的；真正会让它失效的时刻是
- *   **本机的安装变了**（.deb 被升级、app 自更新、重装）。所以「本机指纹变化」
- *   是唯一的停用触发器；上游有新版本只记录、只播报，不动配置。
- *   想让上游一发版就停用，加 --disable-on-upstream 或设
- *   WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM=1。
+ * 唯一数据源：`https://www.workbuddy.cn/v2/update?platform=<platform>`
+ *   取响应里的 productVersion（形如 5.9.3.42398134）。可用环境变量
+ *   WORKBUDDY_WATCH_UPSTREAM（整个 URL）或 WORKBUDDY_WATCH_PLATFORM（平台串）覆盖。
  *
- * 本机指纹（全部只读，不需要 root）：
- *   - dpkg 里的 workbuddy 版本号                 (5.6.2)
- *   - app.asar 的 package.json version           (5.6.2)
- *   - 内置插件的 build id                        (5.6.2-wb.40046327.gc7b525f3…)
- *   - cli/product.json 的 commit                 (c7b525f38b84…)
- *   注意 /opt/WorkBuddy/version 里是 **Electron** 版本（37.10.3-24），
- *   不是 WorkBuddy 自身版本，只作展示，不参与判定。
+ * **刻意不读本机安装**。
+ *   早先的判据是扫描 app.asar / 内置插件 build id / cli/product.json 拼成一个
+ *   指纹，问题有两个：一是每个平台的安装布局不一样（deb 在 /opt，macOS 在
+ *   .app/Contents），漏读就静默降级；二是「同版本重装、asar 大小变了一点」这种
+ *   与版本无关的改动也会触发。现在判据只有一个数字：接口版本 ≠ 记录版本。
+ *   代价是：读不到接口就无法判定——本轮直接跳过，绝不猜、绝不误停用。
+ *
+ * 基点（baseline）与重锚：
+ *   state.json 的 `baseline.version`。没有基线时（首轮、或 state.json 被删）
+ *   直接落基线、不报警；之后每轮把基线推进到接口当前值，所以同一个版本上
+ *   不会反复弹提示。要重新落基点，删掉 state.json 里的 baseline 即可。
  *
  * 停用方式：把 dsh-connect-workbuddy 从
  *   ~/.dsh/profiles/<profile>/package.json 的 dsh.profile.bundles 里摘掉，
@@ -43,7 +44,7 @@
  *   node workbuddy-update-watch.mjs --dry-run       # 只报告「本来会做什么」
  *   node workbuddy-update-watch.mjs --status        # 打印当前状态，不联网
  *   node workbuddy-update-watch.mjs --ack           # 把待播报事件标记为已播报
- *   node workbuddy-update-watch.mjs --simulate-local 9.9.9.999   # 测试用
+ *   node workbuddy-update-watch.mjs --simulate-version 9.9.9.999  # 把接口版本当成它（测试用）
  *   node workbuddy-update-watch.mjs --simulate-plugin 9.9.9      # 测试用
  *   node workbuddy-update-watch.mjs --clear-watermark            # 手动清水印
  *   附加：--no-notify  --no-upgrade  --state-dir <dir>  --profile <name>  --profile-dir <dir>
@@ -52,10 +53,9 @@
  * 退出码：0 正常（含「无更新」）；1 运行出错（网络错误不算错，只降级）。
  */
 import { execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import {
-  appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync,
-  readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync,
+  appendFileSync, copyFileSync, existsSync, mkdirSync,
+  readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -78,33 +78,12 @@ const STATE_DIR = join(DSH_HOME, 'workbuddy-update-watch')
 const DEFAULT_PROFILE = process.env.DSH_PROFILE || 'web'
 
 /**
- * 本机 WorkBuddy 的安装根目录，按平台猜。
- *
- * Linux 用的是 deb 装到 /opt；macOS 是 .app 包（里面的版本信息在
- * Contents/Resources 下，所以这里指向 Contents）；Windows 走 electron-builder
- * 的默认安装位置。全部可用 WORKBUDDY_APP_DIR 覆盖。
- *
- * 注意：这个「猜」只影响**能不能读到版本**，读不到时会降级成
- * `unknown` 并照常写日志，不会误停用任何东西。
- */
-function guessAppDir() {
-  if (process.env.WORKBUDDY_APP_DIR) return process.env.WORKBUDDY_APP_DIR
-  if (process.platform === 'darwin') return '/Applications/WorkBuddy.app/Contents'
-  if (process.platform === 'win32') {
-    const local = process.env.LOCALAPPDATA
-    return local ? join(local, 'Programs', 'WorkBuddy', 'resources') : 'C:\\Program Files\\WorkBuddy\\resources'
-  }
-  return '/opt/WorkBuddy'
-}
-const APP_DIR = guessAppDir()
-
-/**
  * 上游版本接口的 platform 标识。
  *
  * 这是 WorkBuddy 官网下载页自己用的那套名字（见它的 download-*.js：
  * `workbuddy-linux-x64-deb` / `workbuddy-darwin-arm64` /
- * `workbuddy-win32-x64-user` …）。猜错时接口返回 404，脚本按「读不到上游」
- * 降级，仍然能靠本机指纹工作。
+ * `workbuddy-win32-x64-user` …）。猜错时接口返回 404，脚本按「读不到接口」
+ * 降级：本轮不判定、不改配置，只在日志里记一条。
  */
 function guessUpstreamPlatform() {
   if (process.env.WORKBUDDY_WATCH_PLATFORM) return process.env.WORKBUDDY_WATCH_PLATFORM
@@ -135,7 +114,13 @@ const ACK = flag('--ack')
 const ENABLE = flag('--enable')               // 把 bundle 重新加回（撤销停用）
 const DISABLE_NOW = flag('--disable')         // 立刻停用（供插件在用户确认后调用）
 const CLEAR_WATERMARK = flag('--clear-watermark')
-const SIMULATE_LOCAL = opt('--simulate-local', null)
+/**
+ * 演练：把**接口返回的版本**当成这个值，用来在不改任何真实状态的前提下走一遍
+ * 「检测到不一致 → 挂提示」的完整链路。
+ *
+ * `--simulate-local` 是历史名字（那时判定还在读本机安装），保留为别名。
+ */
+const SIMULATE_VERSION = opt('--simulate-version', null) ?? opt('--simulate-local', null)
 const SIMULATE_PLUGIN = opt('--simulate-plugin', null)
 const PROFILE = opt('--profile', DEFAULT_PROFILE)
 const PROFILE_DIR = opt('--profile-dir', join(DSH_HOME, 'profiles', PROFILE))
@@ -195,16 +180,15 @@ function releaseLock() {
  *
  * config.json（不需要就删掉，删掉即回到默认）：
  *   {
- *     "disableOn": "local"      // "local" | "upstream" | "either" | "never"
+ *     "disableOn": "local",     // 兼容旧键，见下
+ *     "autoDisable": false      // 检测到就立刻停用（无人值守）
  *   }
  *
- *   local    —— 只有本机 WorkBuddy 真的升级了才停用（默认，最符合「插件可能被
- *               上游接口变更搞坏」这件事的真实时机）
- *   upstream —— 上游一发新版本就停用（更保守，宁早勿晚）
- *   either   —— 上面任一发生即停用
- *   never    —— 只记录/通知，永不自动改动 profile
- *
- * 环境变量 WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM=1 等价于 disableOn: "either"。
+ * `disableOn` 是「判定源」时代的产物，那时有两个触发器（本机安装 / 上游发布）。
+ * 现在判定只剩一条规则（接口版本 ≠ 记录版本），所以：
+ *   "never"  —— 仍然有效：命中只挂提示，永不自动改 profile
+ *   其它值   —— 视为默认（命中即视为停用条件，要不要当场停用由 autoDisable 决定）
+ * 环境变量 WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM=1 也仍然被当作「启用停用条件」。
  */
 function effectiveConfig() {
   const defaults = { disableOn: 'local', autoDisable: false }
@@ -214,7 +198,8 @@ function effectiveConfig() {
     : String(fromFile.disableOn ?? defaults.disableOn)
   const valid = new Set(['local', 'upstream', 'either', 'never'])
   return {
-    disableOn: valid.has(disableOn) ? disableOn : defaults.disableOn,
+    /** 命中版本不一致时，这条事件算不算「停用条件」。 */
+    disableOnHit: (valid.has(disableOn) ? disableOn : defaults.disableOn) !== 'never',
     /**
      * 检测到之后要不要**立刻**停用。
      *
@@ -222,6 +207,7 @@ function effectiveConfig() {
      * 置 true 就回到旧行为（自动停用），留给需要无人值守的场景。
      */
     autoDisable: fromFile.autoDisable === true,
+    rawDisableOn: disableOn,
     configFile: CONFIG_FILE,
     configFileExists: existsSync(CONFIG_FILE),
   }
@@ -276,128 +262,6 @@ function compareVersions(a, b) {
     }
   }
   return 0
-}
-
-// ---------------------------------------------------------------------------
-// 本机 WorkBuddy 指纹
-// ---------------------------------------------------------------------------
-
-/** dpkg 记录的版本号（5.6.2）。没装 deb 时返回 null。 */
-function readDpkgVersion() {
-  try {
-    const out = execFileSync('dpkg-query', ['-W', '-f=${Version}', 'workbuddy'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
-    }).trim()
-    return out || null
-  } catch { return null }
-}
-
-/** /opt/WorkBuddy/version —— 这是 Electron 的版本，只做展示。 */
-function readElectronVersion() {
-  try { return readFileSync(join(APP_DIR, 'version'), 'utf8').trim() || null } catch { return null }
-}
-
-/**
- * app.asar 的数据区起点与大小。
- * asar 布局（实测本机这份 317MB 的文件）：
- *   [0..3]   u32 = 4
- *   [4..7]   u32 headerSize   —— 数据区起点 = 8 + headerSize
- *   [8..11]  u32 strLen
- *   [12..15] u32 jsonLen      —— JSON 头从偏移 16 开始，长 jsonLen
- * 注意不能 readFileSync 整个文件（300MB+），一律按需 seek。
- */
-function readAsarPackage(asarPath) {
-  const head = Buffer.alloc(16)
-  const fd = openSync(asarPath, 'r')
-  try {
-    readSync(fd, head, 0, 16, 0)
-    const headerSize = head.readUInt32LE(4)
-    const jsonLen = head.readUInt32LE(12)
-    const json = Buffer.alloc(jsonLen)
-    readSync(fd, json, 0, jsonLen, 16)
-    const header = JSON.parse(json.toString('utf8'))
-    const entry = header?.files?.['package.json']
-    if (!entry) return { version: null, productName: null }
-    const buf = Buffer.alloc(Number(entry.size))
-    readSync(fd, buf, 0, buf.length, 8 + headerSize + Number(entry.offset))
-    const pkg = JSON.parse(buf.toString('utf8'))
-    return { version: pkg.version ?? null, productName: pkg.productName ?? null }
-  } catch {
-    return { version: null, productName: null }
-  } finally {
-    closeSync(fd)
-  }
-}
-
-function asarSize(asarPath) {
-  try { return statSync(asarPath).size } catch { return null }
-}
-
-/**
- * 内置插件清单里的 build id：版本形如
- *   5.6.2-wb.40046327.gc7b525f3.hbf00e3f3d64d
- * 与上游 /v2/update 的 productVersion「5.6.2.40046327」完全同构，
- * 所以是最可靠的「同一构建」判据。
- */
-function readBuiltinBuild() {
-  const base = join(APP_DIR, 'resources', 'app.asar.unpacked', 'resources', 'plugins', 'workbuddy-builtin')
-  const modes = ['plan', 'quick', 'ask', 'expert', 'craft']
-  for (const mode of modes) {
-    const file = join(base, 'interactionmode', mode, '.workbuddy-plugin', 'plugin.json')
-    try {
-      const version = String(JSON.parse(readFileSync(file, 'utf8')).version || '')
-      const m = version.match(/(\d+\.\d+\.\d+)-wb\.(\d+)/)
-      if (m) return { version: `${m[1]}.${m[2]}`, raw: version }
-    } catch { /* 试下一个 */ }
-  }
-  // 兜底：整个 builtin 目录下随便找一个 plugin.json
-  return { version: null, raw: null }
-}
-
-/** cli/product.json 的 commit，与上游下载文件名里的 hash 前 8 位同源。 */
-function readBuildCommit() {
-  try {
-    const product = JSON.parse(readFileSync(
-      join(APP_DIR, 'resources', 'app.asar.unpacked', 'cli', 'product.json'), 'utf8',
-    ))
-    const commit = typeof product.commit === 'string' ? product.commit : null
-    return { commit, commitShort: commit ? commit.slice(0, 8) : null, buildDate: product.date ?? null }
-  } catch { return { commit: null, commitShort: null, buildDate: null } }
-}
-
-function readLocal() {
-  const dpkgVersion = readDpkgVersion()
-  const electronVersion = readElectronVersion()
-  const asarPath = join(APP_DIR, 'resources', 'app.asar')
-  const asar = readAsarPackage(asarPath)
-  const asarBytes = asarSize(asarPath)
-  const builtin = readBuiltinBuild()
-  const build = readBuildCommit()
-
-  // 判定用的版本：优先「与上游同构」的 build id，其次 app.asar 的 version，最后 dpkg
-  const version = builtin.version || asar.version || dpkgVersion || electronVersion || 'unknown'
-  const display = builtin.version
-    ? `${builtin.version}`
-    : `${version}${dpkgVersion ? ` (deb ${dpkgVersion})` : ''}`
-
-  const fingerprint = createHash('sha256').update(JSON.stringify([
-    dpkgVersion, asar.version, asarBytes, builtin.version, build.commit,
-  ])).digest('hex').slice(0, 32)
-
-  return {
-    installed: existsSync(asarPath),
-    version,
-    display,
-    dpkgVersion,
-    electronVersion,
-    asarVersion: asar.version,
-    asarSize: asarBytes,
-    builtinVersionRaw: builtin.raw,
-    commit: build.commit,
-    commitShort: build.commitShort,
-    buildDate: build.buildDate,
-    fingerprint,
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +648,6 @@ async function main() {
         mode: 'status',
         targetInstalled: false,
         targetEvidence: target.evidence,
-        local: readLocal().display,
         guardFile: GUARD_FILE,
         stateFile: STATE_FILE,
         note: `${BUNDLE} 未安装 —— 守卫不执行任何动作`,
@@ -814,7 +677,6 @@ async function main() {
 
   // --status / --ack 不联网、不检查
   if (ASTATUS) {
-    const local = readLocal()
     const plugin = readInstalledPlugin()
     const guard = readGuardFile()
     return {
@@ -824,10 +686,11 @@ async function main() {
       guardFile: GUARD_FILE,
       profileManifest: profileManifestPath(),
       bundleSelected: bundleSelected(),
-      local: local.display,
+      baselineVersion: state.baseline?.version ?? null,
+      baselineAt: state.baseline?.updatedAt ?? null,
+      upstreamUrl: UPSTREAM_URL,
       pluginInstalled: plugin.version,
       pluginDeclared: plugin.declared ?? null,
-      upstreamSeen: state.upstreamSeen?.version ?? null,
       pluginSeen: state.pluginSeen?.version ?? null,
       watermark: guard.watermark ? { title: guard.watermark.title, body: guard.watermark.body, at: guard.watermark.at } : null,
       pendingStop: guard.stopSessions && !guard.stopSessions.handled ? guard.stopSessions.revision : null,
@@ -877,7 +740,7 @@ async function main() {
         at: nowIso(),
         bundle: BUNDLE,
         reason: 'user-confirmed',
-        from: state.baseline?.display ?? null,
+        from: state.baseline?.version ?? null,
         to: null,
         backup: result.backup,
         restore: `node ${process.argv[1]} --enable   # 或把 "${BUNDLE}" 加回 profile 的 dsh.profile.bundles`,
@@ -890,23 +753,39 @@ async function main() {
     return { mode: 'disable', changed: result.changed, result }
   }
 
-  const local = readLocal()
-  const simulated = SIMULATE_LOCAL !== null
-  if (simulated) {
-    local.fingerprint = `simulated:${SIMULATE_LOCAL}`
-    local.version = SIMULATE_LOCAL
-    local.display = `${SIMULATE_LOCAL} (模拟)`
-    log('warn', `演练模式：把本机版本当成 ${SIMULATE_LOCAL}`)
-  }
+  /**
+   * 唯一数据源：上游接口。
+   *
+   * 这里**不再**读本机安装（app.asar / dpkg / 内置 build id / git commit 全部
+   * 删掉了）。理由见文件头：判据只要一个数字，越少的读取路径越难误判。
+   */
+  const simulated = SIMULATE_VERSION !== null
+  const upstream = simulated
+    ? { ok: true, version: SIMULATE_VERSION, url: null, publishedAt: null, simulated: true }
+    // 演练时**不联网**：既快，也能在没有外网的机器上验证整条链路。
+    : await readUpstream()
+  if (simulated) log('warn', `演练模式：把接口版本当成 ${SIMULATE_VERSION}（不联网、不推进基线）`)
 
-  const upstream = await readUpstream()
   const config = effectiveConfig()
-  const disableLocal = config.disableOn === 'local' || config.disableOn === 'either'
-  const disableUpstream = config.disableOn === 'upstream' || config.disableOn === 'either'
 
   const events = []
   const firstRun = !state.baseline
   const reported = new Set(state.reportedKeys ?? [])
+  /**
+   * 老格式基线的迁移点。
+   *
+   * 旧版本把「本机指纹」写进 baseline（带 fingerprint/commit/asarSize），其中
+   * version 是本机内置插件的 build id（如 5.9.2.42136757），和新判据用的接口
+   * 版本（如 5.9.3.42398134）根本不是一个体系。直接比必然对不上，于是规则切换
+   * 的那一刻会凭空弹一次「更新了」。
+   *
+   * 所以：发现 baseline 不是 upstream 口径，就把它当「没有基线」——这一轮
+   * 静默重锚到接口当前值，不报事件、不挂水印。
+   */
+  const legacyBaseline = Boolean(state.baseline) && state.baseline?.source !== 'upstream'
+  if (legacyBaseline) {
+    log('warn', `基线是旧格式（${state.baseline?.version ?? '?'}，来自本机指纹），按「无基线」重新落基点`)
+  }
 
   /** 加一条事件，但 same kind+from+to 已经报过就不再报。 */
   const pushEvent = (event) => {
@@ -920,42 +799,30 @@ async function main() {
     return true
   }
 
-  // 1) 本机安装变了 —— 默认的停用触发器
-  if (!firstRun && state.baseline.fingerprint !== local.fingerprint) {
-    const fresh = pushEvent({
+  // 1) 版本号对不上 —— 唯一的停用触发器
+  //
+  // 比的是字符串本身，不比大小：降级（接口回退到旧版本）同样算「变了」，
+  // 因为客户端被换成旧构建同样可能让插件的私有接口失效。
+  let versionChanged = false
+  // 版本是否真的不一致（跟「这一轮有没有报出来」分开：去重会让事件为 0）。
+  const mismatch = upstream.ok && !firstRun && !legacyBaseline
+    && state.baseline.version !== upstream.version
+  if (!upstream.ok) {
+    // 读不到接口就**不判定**：既不推进基线，也不报事件。下一轮再试。
+    log('warn', `读取接口版本失败: ${upstream.error} —— 本轮不判定`)
+  } else if (firstRun || legacyBaseline) {
+    log('info', `落基线：接口版本 ${upstream.version}（不报警）`)
+  } else if (mismatch) {
+    const recorded = state.baseline.version
+    versionChanged = pushEvent({
       at: nowIso(),
-      kind: 'local-updated',
-      from: state.baseline.display,
-      to: local.display,
-      action: disableLocal ? 'disable-bundle' : 'report-only',
+      kind: 'wb-version-changed',
+      from: recorded,
+      to: upstream.version,
+      action: config.disableOnHit ? 'disable-bundle' : 'report-only',
+      url: upstream.url ?? null,
     })
-    if (fresh) log('warn', `本机 WorkBuddy 指纹变化: ${state.baseline.display} → ${local.display}`)
-  }
-
-  // 2) 上游发了新版本 —— 默认只播报，disableOn 含 upstream 时才停用
-  let upstreamNewer = false
-  if (upstream.ok) {
-    const seen = state.upstreamSeen?.version
-    if (seen && upstream.version !== seen) {
-      const cmp = compareVersions(upstream.version, local.version)
-      if (cmp > 0) {
-        upstreamNewer = true
-        pushEvent({
-          at: nowIso(),
-          kind: 'upstream-newer',
-          from: seen,
-          to: upstream.version,
-          local: local.version,
-          action: disableUpstream ? 'disable-bundle' : 'report-only',
-          url: upstream.url,
-        })
-        log('info', `上游发布了新版本 ${upstream.version}（本机 ${local.version}）`)
-      } else if (cmp < 0) {
-        log('info', `上游 ${upstream.version} 落后于本机 ${local.version}（测试版或镜像滞后），忽略`)
-      }
-    }
-  } else {
-    log('warn', `读取上游版本失败: ${upstream.error}`)
+    if (versionChanged) log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → 接口 ${upstream.version}`)
   }
 
   // 3) 插件自身版本 —— 有新版就地升级，并挂「重启生效」水印
@@ -1032,7 +899,7 @@ async function main() {
           detail: `${trigger.from} → ${trigger.to} · ${BUNDLE} 已停用`,
         })
         issueStopSessions(
-          `本机 WorkBuddy 已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,
+          `WorkBuddy 客户端已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,
           STOP_TEXT,
           trigger.from,
           trigger.to,
@@ -1043,8 +910,8 @@ async function main() {
       /**
        * 默认路径：**只报警，不动手**。
        *
-       * 检测到本机 WB 变了，把「该停用了」这件事写进水印，由用户在界面上选
-       * 「软结束」或「硬结束」。守卫不再替用户决定什么时候掐断他的会话——
+       * 检测到版本号对不上，把「该停用了」这件事写进水印，由用户在界面上选
+       * 「软结束」或「硬结束」。守卫不替用户决定什么时候掐断他的会话——
        * 一个正在跑的任务被自动中止，比晚几秒停用糟糕得多。
        *
        * 水印上带 `pendingDisable` 与 `actions`，浏览器半据此画出三个按钮。
@@ -1060,7 +927,7 @@ async function main() {
         from: trigger.from,
         to: trigger.to,
       })
-      log('warn', `检测到本机 WorkBuddy 更新（${trigger.from} → ${trigger.to}），已挂提示，等待用户选择软结束/硬结束`)
+      log('warn', `检测到 WorkBuddy 版本变化（${trigger.from} → ${trigger.to}），已挂提示，等待用户选择软结束/硬结束`)
     }
   } else if (triggers.length > 0 && MODE_CHECK) {
     log('info', `--check 模式：命中 ${triggers.length} 个停用条件，但不修改 profile`)
@@ -1070,35 +937,41 @@ async function main() {
   if (!DRY_RUN) {
     state.schema = SCHEMA
     /**
-     * 演练模式**不写基线**。
+     * 基线推进规则：**只有真的读到接口才推进**。
      *
-     * 基线是「这台机器上次见到的真实安装」。把 `simulated:9.9.9` 写进去之后，
-     * 下一轮真实检查会看到指纹从模拟值变回真值，于是又报一次「本机更新」，
-     * 在 reportedKeys 里留下一条假事件——测试本身污染了被测对象。
-     * 演练要的是「走一遍动作」，不是「改写历史」。
+     * 因为「基线 = 上次接口返回的版本」，读不到接口时推进就等于把基点清零，
+     * 下一轮成功时会凭空报一次变化。
+     *
+     * 演练模式（--simulate-version）不推进：否则模拟值会被写成真基线，下一轮
+     * 真实检查又会看到「变回去」，测试本身污染被测对象。演练要的是走一遍动作。
+     *
+     * 另外：命中版本变化时也照样推进——同一版本不该反复弹提示。去重还有
+     * reportedKeys（kind|from|to）兜底。
      */
-    if (!simulated) {
+    if (upstream.ok && !simulated && !MODE_CHECK) {
       state.baseline = {
-        fingerprint: local.fingerprint,
-        version: local.version,
-        display: local.display,
-        dpkgVersion: local.dpkgVersion,
-        builtinVersionRaw: local.builtinVersionRaw,
-        commit: local.commit,
-        asarSize: local.asarSize,
-        capturedAt: state.baseline?.capturedAt ?? nowIso(),
-        updatedAt: nowIso(),
-      }
-    } else {
-      log('info', '演练模式：不更新基线指纹（避免污染下一轮真实检查）')
-    }
-    if (upstream.ok) {
-      state.upstreamSeen = {
         version: upstream.version,
-        url: upstream.url,
-        firstSeenAt: state.upstreamSeen?.firstSeenAt ?? nowIso(),
+        source: 'upstream',
+        ...(state.baseline?.capturedAt ? { capturedAt: state.baseline.capturedAt } : {}),
+        ...(state.baseline?.version === upstream.version ? {} : { changedAt: nowIso() }),
         updatedAt: nowIso(),
       }
+    } else if (simulated) {
+      log('info', '演练模式：不推进基线（避免污染下一轮真实检查）')
+    } else if (MODE_CHECK) {
+      // `--check` 是「只看一眼」：连基线都不推进。否则跑一次 --check 就把这次
+      // 变化「消费」掉了，真正该弹的提示反而不会弹。
+      log('info', '--check 模式：不推进基线（这次变化留给正常检查去报）')
+    }
+    /**
+     * 清掉旧字段。
+     *
+     * `upstreamSeen` 是「上游发布」与「本机安装」两条触发器并存时的记录，
+     * 现在它和 baseline 表达同一件事，留着只会让人以为有两个基点。
+     */
+    if (state.upstreamSeen !== undefined) {
+      delete state.upstreamSeen
+      log('info', '已清理旧字段 upstreamSeen（现在只有 baseline 一个基点）')
     }
     if (pluginLatest.ok) {
       state.pluginSeen = {
@@ -1135,10 +1008,10 @@ async function main() {
     state.lastUpstreamError = upstream.ok ? null : upstream.error
     state.lastPluginError = pluginLatest.ok || NO_UPGRADE ? null : pluginLatest.error
     writeJsonAtomic(STATE_FILE, state)
-    log('info', `检查 #${state.checks}：本机 ${local.display}，上游 ${upstream.ok ? upstream.version : `读取失败(${upstream.error})`}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
+    log('info', `检查 #${state.checks}：接口 ${upstream.ok ? upstream.version : `读取失败(${upstream.error})`}${simulated ? '(模拟)' : ''}，基线 ${state.baseline?.version ?? '?'}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
   }
 
-  // 5) 通知（只在真的停用、待用户确认、或明确要求播报上游新版时弹）
+  // 5) 通知（只在真的停用、待用户确认、或插件自升级时弹）
   if (pendingDisable) {
     notify('WorkBuddy 更新了 —— 等待你选择',
       `${triggers[0].from} → ${triggers[0].to}\n插件还在运行；到界面上选「软结束」或「硬结束」。`)
@@ -1147,25 +1020,23 @@ async function main() {
       `${triggers[0].from} → ${triggers[0].to}\n已停用 ${BUNDLE}；界面已挂水印，正在用它的会话已被软结束。\n恢复：node ${process.argv[1]} --enable`)
   } else if (pluginUpgrade?.upgraded) {
     notify('WorkBuddy 插件已升级', `${installedVersion} → ${pluginLatest.version}\n重启 DSH 生效。`)
-  } else if (upstreamNewer && !MODE_CHECK) {
-    notify('WorkBuddy 上游有新版本', `${upstream.version}（本机 ${local.version}）—— 插件仍启用；升级本机后会自动停用`)
   }
 
   return {
     mode: DRY_RUN ? 'dry-run' : (MODE_CHECK ? 'check' : 'watch'),
     checkedAt: nowIso(),
     firstRun,
-    local: {
-      display: local.display,
-      version: local.version,
-      dpkgVersion: local.dpkgVersion,
-      asarVersion: local.asarVersion,
-      commitShort: local.commitShort,
-      electronVersion: local.electronVersion,
-      fingerprint: local.fingerprint,
-    },
+    legacyBaseline,
+    baseline: state.baseline
+      ? { version: state.baseline.version, source: state.baseline.source ?? null, updatedAt: state.baseline.updatedAt ?? null }
+      : null,
     upstream: upstream.ok
-      ? { version: upstream.version, publishedAt: upstream.publishedAt, url: upstream.url }
+      ? {
+        version: upstream.version,
+        publishedAt: upstream.publishedAt ?? null,
+        url: upstream.url ?? null,
+        simulated,
+      }
       : { error: upstream.error },
     plugin: {
       installed: installedVersion ?? null,
@@ -1175,7 +1046,8 @@ async function main() {
       upgrade: pluginUpgrade,
       error: pluginLatest.ok ? null : (NO_UPGRADE ? 'disabled' : pluginLatest.error),
     },
-    upstreamNewer,
+    versionChanged,
+    mismatch,
     events,
     changed: events.length > 0,
     disabled: disableResult?.changed ?? false,
@@ -1184,7 +1056,11 @@ async function main() {
     bundleSelected: bundleSelected(),
     pendingReport: (state.pendingReport ?? []).length,
     note: events.length === 0
-      ? '无变化'
+      ? (!upstream.ok
+        ? '本轮不判定（读不到接口版本）'
+        : (firstRun || legacyBaseline
+          ? '落基线，不报警'
+          : (mismatch ? '版本不一致，但这条事件已提示过（不重复弹）' : '无变化（接口版本与基线一致）')))
       : (disableResult?.changed
         ? `已停用 ${BUNDLE}，已挂水印并下发软结束指令`
         : (pluginUpgrade?.upgraded ? '插件已升级，已挂重启水印' : '见 disableResult/plugin')),

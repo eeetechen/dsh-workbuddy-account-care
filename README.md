@@ -4,7 +4,7 @@
 >
 > **安装本插件之前，请先安装 `dsh-connect-workbuddy`。** 没有它，本插件不产生任何效果。
 >
-> 本机 WorkBuddy 客户端一旦升级，立刻停用那个插件；它自己在 npm 上有新版，就自动升级并提示重启。
+> WorkBuddy 官方接口报的版本号一旦和本地记录的对不上，立刻停用那个插件；它自己在 npm 上有新版，就自动升级并提示重启。
 > 全程零模型调用，DSH 不启动就什么都不做。
 
 ![WorkBuddy 升级后的红色水印](docs/watermark-updated.png)
@@ -40,18 +40,48 @@ dsh plugin --profile web add dsh-workbuddy-guard
 
 ## 它解决什么
 
-`dsh-connect-workbuddy` 靠**本机 WorkBuddy 客户端的私有接口**工作（伪装客户端、
-复用本机登录态），上游随时可能收紧。这个守卫把风险面收窄成两条规则：
+`dsh-connect-workbuddy` 靠 **WorkBuddy 客户端的私有接口**工作（伪装客户端、
+复用本机登录态），客户端一更新，那些接口随时可能变。这个守卫把风险面收窄成两条规则：
 
 | 事件 | 动作 |
 |---|---|
-| **本机 WorkBuddy 被升级 / 重装** | 停用 `dsh-connect-workbuddy` + 红色水印 + 软结束正在用它的会话 + 桌面通知 |
+| **WorkBuddy 版本号与基线不一致** | 红色水印 + 让你选怎么结束（软结束 / 硬结束）+ 桌面通知 |
 | **`dsh-connect-workbuddy` 在 npm 上有新版** | 自动升级 + 橙色水印提示重启 DSH |
-| 上游发布新版本（本机没动） | 只记日志，**不动配置** |
 | 什么都没有 | 静默，只写一行日志 |
 
-判断依据是**本机安装的版本**，不是上游发布：上游发版但你没升级时，那个插件
-仍然能用，没必要提前停掉。
+判断依据只有一个数字：**官方接口报的版本号 ≠ 本地记录的基线版本号**。规则很硬，
+没有「可能」、「大概」、「指纹相近」——对不上就是变了，对上就什么都不做。
+
+## 判定数据源
+
+整个守卫只读**一个**外部数据源：
+
+```
+GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
+```
+
+```json
+{
+  "version": "5.9.3.42398134",
+  "productVersion": "5.9.3.42398134",
+  "url": "https://download.codebuddy.cn/workbuddy/saas/…-5.9.3.42398134-d4692421.zip",
+  "sha256hash": "e093e214…",
+  "timestamp": 1793121334
+}
+```
+
+脚本只取 `productVersion`（没有时退回 `version`），与 `state.json` 的
+`baseline.version` 做**字符串比较**：不等就报一次「版本不一致」。
+
+**刻意不读本机安装。** 早先的版本靠在客户端的安装目录里翻 `app.asar` 的
+`package.json`、内置插件的 build id、`cli/product.json` 的 commit，拼成一个指纹。
+那样做有两个问题：安装布局每个平台都不一样（deb 在 `/opt/WorkBuddy`，
+macOS 在 `/Applications/WorkBuddy.app/Contents`），漏读就静默降级；而且
+「同版本重装、`app.asar` 大小变了一点」这种与版本无关的改动也会触发。
+
+代价必须说清楚：**读不到接口就无法判定**。请求超时、404、断网时，脚本这一轮
+什么都不做——不报警、不推进基线、不改配置，只在日志里记一行。它不会拿上次的
+结果硬猜，也不会把「读不到」当成「变了」。
 
 升级后想恢复：
 
@@ -87,7 +117,7 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 
 ## 界面
 
-**本机 WorkBuddy 升级后**（红色，同时会停用插件并软结束会话）：
+**WorkBuddy 版本不一致时**（红色，等你选软结束 / 硬结束）：
 
 ![升级水印](docs/watermark-updated.png)
 
@@ -104,7 +134,7 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 
 ### 检测到更新：先问你，再动手
 
-**默认不再自动停用。** 检测到本机 WorkBuddy 变了之后（指纹对不上基线），守卫会：
+**默认不再自动停用。** 检测到接口版本与基线不一致之后，守卫会：
 
 1. 先看**有没有正在运行的 workbuddy 会话**——没有就不打扰；有才在界面顶部挂提示；
 2. 等你在提示上选一个结束方式。
@@ -190,10 +220,10 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 dsh-workbuddy-guard（Host 半）
   ├─ 每 3 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
-  │     ├─ 读本机 WorkBuddy 版本（dpkg / app.asar / 内置 build id / git commit）
+  │     ├─ 读 WorkBuddy 官方接口 /v2/update 的 productVersion
   │     ├─ 读 npm 上 dsh-connect-workbuddy 的 latest
-  │     ├─ 本机版本变了 → 从 profile 的 bundles 里摘掉它（保留依赖）
-  │     │                  并写 guard.json（水印 + 软结束指令）
+  │     ├─ 接口版本 ≠ 基线 → 写 guard.json（水印，等你选软结束/硬结束）
+  │     │                    基线随即推进，同一版本不会反复弹
   │     └─ npm 有新版本 → dsh plugin add 升级它，写「重启生效」水印
   │
   └─ 每 15 秒读一次 guard.json
@@ -270,15 +300,13 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 策略文件 `~/.dsh/workbuddy-update-watch/config.json`：
 
 ```json
-{ "disableOn": "local" }
+{ "autoDisable": false }
 ```
 
-| 值 | 含义 |
+| 键 | 含义 |
 |---|---|
-| `local` | **默认**。只有本机 WorkBuddy 真的升级了才停用 |
-| `upstream` | 上游一发新版就停用（更保守） |
-| `either` | 任一发生即停用 |
-| `never` | 只记录和通知，永不自动改 profile |
+| `autoDisable` | `false`（**默认**）= 检测到先挂提示，由你在界面上选；`true` = 检测到就当场停用（无人值守） |
+| `disableOn` | 旧键，为兼容保留。`"never"` 仍然有效（命中只挂提示、永不自动改 profile）；其它值都等同于默认 |
 
 ## 环境变量
 
@@ -286,10 +314,9 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 |---|---|---|
 | `DSH_HOME` | `~/.dsh` | DSH 主目录 |
 | `DSH_PROFILE` | `web` | 目标 profile |
-| `WORKBUDDY_APP_DIR` | 按平台猜 | WorkBuddy 安装根（Linux `/opt/WorkBuddy`，macOS `/Applications/WorkBuddy.app/Contents`，Windows `%LOCALAPPDATA%\Programs\WorkBuddy\resources`） |
-| `WORKBUDDY_WATCH_PLATFORM` | 按平台猜 | 上游版本接口的 platform 标识 |
-| `WORKBUDDY_WATCH_UPSTREAM` | 官网 `/v2/update` | 覆盖上游版本接口 |
-| `WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM` | 未设 | 设为 `1` 等价 `disableOn: "either"` |
+| `WORKBUDDY_WATCH_PLATFORM` | 按平台猜 | 版本接口的 platform 标识（`workbuddy-darwin-x64`、`workbuddy-linux-x64-deb`、`workbuddy-win32-x64-user`） |
+| `WORKBUDDY_WATCH_UPSTREAM` | 官网 `/v2/update` | 覆盖版本接口（自建镜像、内网代理时用） |
+| `WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM` | 未设 | 兼容旧配置；设为 `1` 仍表示「命中即算停用条件」 |
 
 ## 状态文件
 
@@ -297,7 +324,7 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 
 | 文件 | 内容 |
 |---|---|
-| `state.json` | 基线指纹、已见版本、事件去重 |
+| `state.json` | 基线版本（`baseline.version`）、已见版本、事件去重 |
 | `guard.json` | 给插件的指令（水印 + 软结束），插件回写 `handled` |
 | `watch.log` | 每次检查一行 |
 | `config.json` | 策略（可选） |
@@ -308,10 +335,17 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 
 - **DSH 不在跑就不检查。** 刻意如此：没有 DSH 进程，就没有任何请求会发出去，
   那时检查没有意义。
-- **只认「本机安装变了」**。如果本机升级发生在 DSH 未运行期间，下次启动后的
-  第一次检查仍然会发现（基线是持久化的）。
-- **降级也会触发**。本机版本变旧同样算「安装变了」——刻意的，降级一样可能
-  打破插件假设。
+- **版本对不上就算变了，不区分升级还是降级**。降级（客户端被回滚到旧构建）
+  同样可能打破插件假设，所以不分方向。
+- **接口读不到就不判定**。断网 / 接口 404 / 超时那一轮什么都不做：不报警、
+  不推进基线、不改配置。宁可晚一轮，也不拿「读不到」当「变了」。
+- **基线即上次接口值**。所以在同一版本上只弹一次；想重新落基点，删掉
+  `state.json` 里的 `baseline`（下一轮静默重建，不报警）。`--check` 也**不**推进
+  基线——它只是「看一眼」，跑一次不该把这次变化消费掉。
+- **基线是旧格式时静默重锚一次**。从「本机指纹」规则切过来的机器，旧基线
+  （如 `5.9.2.42136757`）与新判据（接口版本 `5.9.3.42398134`）不是一个体系，
+  直接比会凭空弹一次；所以脚本把它当「没有基线」处理，直接落新基点，
+  在 `watch.log` 里留一行说明。
 - **Host 插件改代码要重启 DSH**：HMR 不会重新加载已装载的 Host 模块。
   浏览器半（`client.js`）不一样：`client-hmr` 会盯着它的构建产物，文件一变
   页面自己就重新加载。
