@@ -37,7 +37,7 @@
  *       "level": "danger" | "warning" | "info",
  *       "title": "WB 更新了",
  *       "body": "还用，你的账号是批发的吗？",
- *       "detail": "5.6.2.40046327 → 5.9.9.99999999 · 插件已停用",
+ *       "detail": "5.6.2.40046327 → 5.9.9.99999999",
  *       "at": "2026-11-04T10:00:00.000Z",
  *       "untilRestart": false            // true = 只活到下一次 DSH 启动
  *     },
@@ -392,7 +392,7 @@ export function apply(ctx, config = {}) {
       level: 'danger',
       title: previous.title ?? 'WB 更新了',
       body: previous.body ?? '',
-      detail: `${previous.from ?? '?'} → ${previous.to ?? '?'} · ${GUARDED_BUNDLE} 已停用`,
+      detail: `${previous.from ?? '?'} → ${previous.to ?? '?'}`,
       pendingDisable: false,
       actions: [],
       handledBy: action,

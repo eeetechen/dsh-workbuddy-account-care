@@ -390,7 +390,7 @@ function expectedFilenamePlatform(platformId = PLATFORM_ID) {
  * 同一版本会同时挂 .dmg / .zip（其它平台是 .deb / .exe / .AppImage），所以
  * 扩展名不参与判定——版本号才参与。
  */
-function parseDownloadFilename(rawUrl) {
+function parseDownloadFilename(rawUrl, platformId = PLATFORM_ID) {
   if (!rawUrl) return { ok: false, error: 'no-url' }
   let filename
   try {
@@ -409,7 +409,7 @@ function parseDownloadFilename(rawUrl) {
    */
   const m = filename.match(/(\d+\.\d+\.\d+\.\d+)/)
   const ext = (filename.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? '').toLowerCase()
-  const expected = expectedFilenamePlatform()
+  const expected = expectedFilenamePlatform(platformId)
   return {
     ok: Boolean(m),
     ...(m ? { version: m[1] } : { error: 'no-version-in-filename' }),
@@ -930,8 +930,12 @@ async function main() {
         platformId,
         version: SIMULATE_VERSION,
         // 演练不联网，但要造一个形状真实的链接，好让文件名解析那一路也真的跑一遍
-        url: SIMULATE_URL ?? `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(platformId)}/`
-          + `WorkBuddy-${expectedFilenamePlatform(platformId)}-${SIMULATE_VERSION}-d4692421.zip`,
+        // 换链接只对本机那一路生效，否则三个判定平台都会拿到同一个文件名，
+        // 模拟出来的「各平台自洽」就是假的（真链路里每个平台取自己响应里的 url）。
+        url: (SIMULATE_URL !== null && platformId === PLATFORM_ID)
+          ? SIMULATE_URL
+          : `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(platformId)}/`
+            + `WorkBuddy-${expectedFilenamePlatform(platformId)}-${SIMULATE_VERSION}-d4692421.zip`,
         publishedAt: null,
         simulated: true,
       }
@@ -942,7 +946,7 @@ async function main() {
       log('warn', `演练模式：把 ${platformId} 的下载链接换成 ${SIMULATE_URL}`)
     }
 
-    const link = parseDownloadFilename(iface.url)
+    const link = parseDownloadFilename(iface.url, platformId)
     if (link.ok && link.platformOk === false && probe.role === 'judge') {
       // 只提醒、不拦：文件名拼法偶尔会变，为这个停下判定不值得。
       log('warn', `下载链接的平台串对不上（${platformId}，期望 ${link.expectedPlatform}）：${link.filename}`)
@@ -1156,7 +1160,7 @@ async function main() {
           level: 'danger',
           title: 'WB 更新了',
           body: '还用，你的账号是批发的吗？',
-          detail: `${trigger.from} → ${trigger.to} · ${BUNDLE} 已停用`,
+          detail: `${trigger.from} → ${trigger.to}`,
         })
         issueStopSessions(
           `WorkBuddy 客户端已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,
