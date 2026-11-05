@@ -275,9 +275,11 @@ window.__ModuleLoader__.load({
      * 历史会话的 `lastUsed` 会长期保留 workbuddy，如果对全部会话都只看选中值，
      * 那么只要曾经用过一次 WorkBuddy，水印就会永远亮着——那正是要修掉的问题。
      */
-    function useWorkbuddyInUse(sessions) {
+    function useWorkbuddyUsage(sessions) {
       // 拿不到会话服务 → 不知道谁在用，退回「保守显示」，别让守卫静默失效
-      const [inUse, setInUse] = React.useState(sessions === undefined || sessions === null)
+      const [usage, setUsage] = React.useState(
+        sessions === undefined || sessions === null ? { running: true, selected: true } : { running: false, selected: false },
+      )
       React.useEffect(() => {
         if (sessions === undefined || sessions === null) return
         const guarded = (row) => {
@@ -286,27 +288,26 @@ window.__ModuleLoader__.load({
           return pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)
         }
         const read = () => {
-          let found = false
+          let running = false
+          let selected = false
           try {
             const snap = sessions.list.getSnapshot()
-            // 1) 当前会话：选中即提示（刚切过去、还没发送也算）
+            // 1) 当前正在看的会话：选中即提示（刚切过去、还没发送也算）
             const main = Object.values(snap.byId).find((row) => (row.retainedBy?.mainView ?? 0) > 0)
-            if (main !== undefined && guarded(main)) found = true
-            // 2) 后台正在跑的会话
-            if (!found) {
-              for (const id of snap.ids) {
-                const row = snap.byId[id]
-                if (row === undefined || row.running !== true) continue
-                if (guarded(row)) { found = true; break }
-              }
+            if (main !== undefined && guarded(main)) selected = true
+            // 2) 正在跑的会话
+            for (const id of snap.ids) {
+              const row = snap.byId[id]
+              if (row === undefined || row.running !== true) continue
+              if (guarded(row)) { running = true; break }
             }
-          } catch { found = false }
-          setInUse(found)
+          } catch { running = false; selected = false }
+          setUsage((prev) => (prev.running === running && prev.selected === selected ? prev : { running, selected }))
         }
         read()
         return sessions.list.subscribe(read)
       }, [sessions])
-      return inUse
+      return usage
     }
 
     /**
@@ -326,9 +327,18 @@ window.__ModuleLoader__.load({
       const state = useGuardState()
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
-      const inUse = useWorkbuddyInUse(sessions)
-      /** 这条是「等你决定」的提示（带软结束/硬结束按钮），不受 provider 门控。 */
+      const usage = useWorkbuddyUsage(sessions)
+      /** 这条是「等你决定」的提示（带软结束/硬结束按钮）。 */
       const pending = watermark?.pendingDisable === true
+      /**
+       * 两个阶段的门控不一样，这是产品约定的核心：
+       *
+       *   - **待确认**（插件还开着，等你选软结束/硬结束）：
+       *     只在「有 workbuddy 会话正在跑」时显示——没在跑就不打扰。
+       *   - **已处理**（插件已关，或你后来强开了它）：
+       *     跟随 provider 选择——当前会话选中 workbuddy 就出现，切走就消失。
+       */
+      const gateOpen = pending ? usage.running : (usage.running || usage.selected)
 
       /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
       const [snoozedRevision, setSnoozedRevision] = React.useState(null)
@@ -352,13 +362,13 @@ window.__ModuleLoader__.load({
        * 下一秒又被解除、卡片立刻弹回来——表现就是「关不掉」。
        * 现在收起是持久的：只有真的又开始用 WorkBuddy（或插件更新）才会重新提示。
        */
-      const inUseRef = React.useRef(inUse)
-      const previousInUse = React.useRef(inUse)
+      const gateRef = React.useRef(gateOpen)
+      const previousGate = React.useRef(gateOpen)
       React.useEffect(() => {
-        inUseRef.current = inUse
-        if (inUse && !previousInUse.current) setSnoozedRevision(null)
-        previousInUse.current = inUse
-      }, [inUse])
+        gateRef.current = gateOpen
+        if (gateOpen && !previousGate.current) setSnoozedRevision(null)
+        previousGate.current = gateOpen
+      }, [gateOpen])
 
       // revision 变了（插件更新）→ 一切复位，重新播入场动画
       React.useEffect(() => {
@@ -373,7 +383,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { ensureStyles() }, [])
 
-      const visible = watermark !== null && (pending || inUse) && !snoozed && !finished
+      const visible = watermark !== null && gateOpen && !snoozed && !finished
       if (!visible) return null
 
       const accent = accentFor(watermark.level)
@@ -399,7 +409,7 @@ window.__ModuleLoader__.load({
           setLeaving(false)
           // 只有「还在用 WorkBuddy」才重新浮出来；没在用就安静地收着
           reshowTimer.current = setTimeout(() => {
-            if (!inUseRef.current) return
+            if (!gateRef.current) return
             setSnoozedRevision((current) => (current === revision ? null : current))
           }, RESHOW_MS)
         }, LEAVE_MS)

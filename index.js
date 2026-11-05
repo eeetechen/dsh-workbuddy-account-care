@@ -44,7 +44,7 @@
  *     "stopSessions": {                  // 一次性指令，处理完由插件回写 handled
  *       "revision": 7,
  *       "reason": "本机 WorkBuddy 已更新",
- *       "text": "暂停执行，等待重启 agent 工具。本机 provider 已更新，…"
+ *       "text": "本机 provider 已更新，本条消息由监控插件自动发送，…"
  *     }
  *   }
  *
@@ -204,7 +204,7 @@ function textOf(content) {
  * 这句话是给「下一轮的那个 agent」看的：它得知道三件事——现在该停下来、
  * 为什么停（本机 provider 变了）、以及这条消息不是用户本人写的。
  */
-const DEFAULT_STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务'
+const DEFAULT_STOP_TEXT = '本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务, 等待重启 agent 工具'
 
 /**
  * 去重标记：收件箱里已经有这句话的会话，不再重复插一条。
@@ -358,18 +358,34 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  /** 清掉「待确认」水印，并让浏览器半立刻看到。 */
-  async function clearPendingWatermark(file) {
+  /**
+   * 动作完成后把水印从「待确认」改成「已停用」。
+   *
+   * 刻意**不删掉**：插件被摘除后 WorkBuddy provider 也跟着消失，水印自然不显示；
+   * 但用户要是强开了 `dsh-connect-workbuddy`，这条水印就该重新跟着 provider 选择
+   * 出现/消失——所以它得活着，只是不再带按钮。
+   */
+  async function finalizeWatermark(file, action) {
     let snapshot
     try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return null }
-    snapshot.watermark = null
+    const previous = snapshot.watermark ?? {}
+    snapshot.watermark = {
+      level: 'danger',
+      title: previous.title ?? 'WB 更新了',
+      body: previous.body ?? '',
+      detail: `${previous.from ?? '?'} → ${previous.to ?? '?'} · ${GUARDED_BUNDLE} 已停用`,
+      pendingDisable: false,
+      actions: [],
+      handledBy: action,
+      at: new Date().toISOString(),
+    }
     snapshot.revision = (Number(snapshot.revision) || 0) + 1
     snapshot.actionAt = new Date().toISOString()
     const tmp = `${file}.tmp-${process.pid}`
     await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
     await rename(tmp, file)
     publishedWatermarkRevision = snapshot.revision
-    current = { watermark: null, revision: snapshot.revision, guardFile: file }
+    current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
     return snapshot.revision
   }
 
@@ -395,7 +411,7 @@ export function apply(ctx, config = {}) {
 
     const disabled = await disableCurrentBundle()
     if (!disabled.ok) logger.error?.(`[workbuddy-guard] 停用失败: ${disabled.error ?? disabled.stderr ?? disabled.code}`)
-    await clearPendingWatermark(state.file)
+    await finalizeWatermark(state.file, action)
     logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：disabled=${disabled.ok}`)
     return { stopped, idle, disabled }
   }

@@ -71,7 +71,7 @@ const BUNDLE = 'dsh-connect-workbuddy'
  * 与 index.js 的 DEFAULT_STOP_TEXT 保持一致：脚本总是写值，插件只是兜底，
  * 两处文案必须一样，否则「脚本写的」和「插件默认的」会在不同路径上出现分叉。
  */
-const STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务'
+const STOP_TEXT = '本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务, 等待重启 agent 工具'
 const HOME = process.env.HOME || process.env.USERPROFILE || homedir()
 const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
 const STATE_DIR = join(DSH_HOME, 'workbuddy-update-watch')
@@ -854,8 +854,11 @@ async function main() {
     if (result.changed && !DRY_RUN) {
       state.disabled = null
       state.reportedKeys = []
-      updateWatermark(null)
-      log('warn', `已重新启用 ${BUNDLE}，清空事件去重记录并清除水印`)
+      /**
+       * **刻意不清水印**：强开插件后，那条「WB 更新了」应该重新跟着 provider
+       * 选择出现/消失（这是产品约定）。要彻底消掉它用 `--clear-watermark`。
+       */
+      log('warn', `已重新启用 ${BUNDLE}，清空事件去重记录（水印保留，可随 provider 显示）`)
       writeJsonAtomic(STATE_FILE, state)
     }
     return { mode: 'enable', changed: result.changed, result }
