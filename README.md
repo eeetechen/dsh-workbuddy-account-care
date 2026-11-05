@@ -101,6 +101,41 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 周期；取高者的含义很直接：**谁先说新版本，就按谁算**。低的那一路只记一条
 `warn` 日志，`--status` 的 `lastJudge.versionGap` 里也能看到，方便排查。
 
+### 各平台不同步（实测 2026-11-05）
+
+平台标识取自官网下载页自己的那份清单，一共 7 个可用（`workbuddy-latest` 会
+400，`workbuddy-darwin-universal` 也能用但不属于任何一台具体机器）：
+
+| platform | 接口 `productVersion` | 安装包文件名 | 包类型 | 发布时间 |
+|---|---|---|---|---|
+| `workbuddy-darwin-x64` | `5.9.3.42398134` | `WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.zip` | zip | 2026-10-28 01:15 |
+| `workbuddy-darwin-arm64` | `5.9.3.42398134` | `WorkBuddy-darwin-arm64-5.9.3.42398134-d4692421.zip` | zip | 2026-10-28 01:15 |
+| `workbuddy-win32-x64-user` | `5.9.3.42398134` | `WorkBuddy-win32-x64-user-5.9.3.42398134-d4692421.exe` | exe | 2026-10-28 01:15 |
+| `workbuddy-linux-x64-deb` | **`5.6.2.40046327`** | `WorkBuddy-linux-x64-deb-5.6.2.40046327-c7b525f3.deb` | deb | 2026-09-30 19:58 |
+| `workbuddy-linux-x64-rpm` | **`5.6.2.40046327`** | `WorkBuddy-linux-x64-rpm-5.6.2.40046327-c7b525f3.rpm` | rpm | 2026-09-30 19:58 |
+| `workbuddy-linux-arm64-deb` | **`5.6.2.40046327`** | `WorkBuddy-linux-arm64-deb-5.6.2.40046327-c7b525f3.deb` | deb | 2026-09-30 19:58 |
+| `workbuddy-linux-arm64-rpm` | **`5.6.2.40046327`** | `WorkBuddy-linux-arm64-rpm-5.6.2.40046327-c7b525f3.rpm` | rpm | 2026-09-30 19:58 |
+
+两点结论：
+
+1. **每个平台内部，接口字段和文件名都是同一个版本**（7/7 一致，没有一次
+   `versionGap`）。所以「取高者」在真实数据上不会翻转，它只是防患于未然。
+2. **平台之间差一个大版本段**：macOS / Windows 在 `5.9.3`，Linux 全线还在
+   `5.6.2`。
+
+第 2 条不是瑕疵，但它决定了「版本号」必须**限定在同一个 platform 内**才有意义。
+所以 `baseline` 会连带记下 `platformId`：
+
+```json
+{ "version": "5.9.3.42398134", "platformId": "workbuddy-darwin-x64", "source": "interface+link" }
+```
+
+**换平台 = 重新落基点，不报更新。** 触发场景：Node 从 x64 换到 arm64（Rosetta、
+换机器、升级 Node）、手改 `WORKBUDDY_WATCH_PLATFORM`、或者推断规则本身变了。
+这时版本会从 `5.9.3.42398134` 跳到 `5.6.2.40046327`，照旧比较就是一次假的
+「客户端更新了」，会平白弹出停用提示。脚本发现 `baseline.platformId` 与当前
+平台不一致时，只写一条日志并静默重锚。
+
 **刻意不读本机安装。** 早先的版本靠在客户端的安装目录里翻 `app.asar` 的
 `package.json`、内置插件的 build id、`cli/product.json` 的 commit，拼成一个指纹。
 那样做有两个问题：安装布局每个平台都不一样（deb 在 `/opt/WorkBuddy`，
@@ -370,6 +405,9 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
   同样可能打破插件假设，所以不分方向。
 - **接口读不到就不判定**。断网 / 接口 404 / 超时那一轮什么都不做：不报警、
   不推进基线、不改配置。宁可晚一轮，也不拿「读不到」当「变了」。
+- **平台是判定作用域的一部分**。各平台不同步发版（Linux 比 macOS/Windows 落后
+  一个大版本段），所以 `baseline` 记着 `platformId`；平台一变就静默重锚，
+  不把它当成「客户端更新」。
 - **基线即上次接口值**。所以在同一版本上只弹一次；想重新落基点，删掉
   `state.json` 里的 `baseline`（下一轮静默重建，不报警）。`--check` 也**不**推进
   基线——它只是「看一眼」，跑一次不该把这次变化消费掉。

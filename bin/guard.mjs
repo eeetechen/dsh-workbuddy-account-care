@@ -69,6 +69,7 @@ function cmdStatus() {
     process.exit(0)
   }
   say(`baseline    ${v.baselineVersion ?? '(none — 下一轮自动落基线)'}`
+    + `${v.baselinePlatform ? `  [${v.baselinePlatform}]` : ''}`
     + `${v.baselineSource ? `  (${v.baselineSource})` : ''}${v.baselineAt ? `  @ ${v.baselineAt}` : ''}`)
   const j = v.lastJudge
   if (j) {

@@ -97,8 +97,16 @@ function guessUpstreamPlatform() {
   if (process.platform === 'win32') return `workbuddy-win32-${arch}-user`
   return `workbuddy-linux-${arch}-deb`
 }
+/**
+ * 本机对应的平台标识，同时也是**判定作用域**。
+ *
+ * 这条很要紧：官方各平台不是同步发版的（实测 macOS/Windows 在 5.9.3，
+ * Linux 全线还停在 5.6.2）。所以「版本号」只有在同一个 platform 下才有可比性，
+ * 换一个 platform 去比，等于拿两个产品的版本号对撞。
+ */
+const PLATFORM_ID = guessUpstreamPlatform()
 const UPSTREAM_URL = process.env.WORKBUDDY_WATCH_UPSTREAM
-  || `https://www.workbuddy.cn/v2/update?platform=${guessUpstreamPlatform()}`
+  || `https://www.workbuddy.cn/v2/update?platform=${PLATFORM_ID}`
 
 // ---------------------------------------------------------------------------
 // 参数
@@ -759,10 +767,12 @@ async function main() {
       profileManifest: profileManifestPath(),
       bundleSelected: bundleSelected(),
       baselineVersion: state.baseline?.version ?? null,
+      baselinePlatform: state.baseline?.platformId ?? null,
       baselineAt: state.baseline?.updatedAt ?? null,
       baselineSource: state.baseline?.source ?? null,
       baselineLinkFile: state.baseline?.linkFile ?? null,
       upstreamUrl: UPSTREAM_URL,
+      platformId: PLATFORM_ID,
       platform: expectedFilenamePlatform(),
       lastJudge: state.lastJudge ?? null,
       pluginInstalled: plugin.version,
@@ -930,6 +940,22 @@ async function main() {
    * 原样沿用，不重锚。
    */
   const legacyBaseline = Boolean(state.baseline) && state.baseline?.source === undefined
+  /**
+   * 平台变了 = 判定作用域变了，不是客户端更新。
+   *
+   * 触发场景：Node 从 x64 换成 arm64（Rosetta、换机器、升级 Node）、用户改了
+   * WORKBUDDY_WATCH_PLATFORM、或者代码里的推断规则变了。这时版本号会从
+   * 5.9.3.42398134 跳到 5.6.2.40046327（Linux 线），照旧比较就是一次假的
+   * 「客户端更新了」，会平白弹出停用提示。
+   *
+   * 所以：老基线记着别的平台 → 静默重锚，只在日志里说一句。
+   */
+  const platformChanged = Boolean(state.baseline?.platformId) && state.baseline.platformId !== PLATFORM_ID
+  if (platformChanged) {
+    log('warn', `判定平台变了（${state.baseline.platformId} → ${PLATFORM_ID}），版本号不可比，重新落基点`)
+  }
+  /** 这两种情况都按「没有基线」处理：不报事件，直接落新基点。 */
+  const reanchor = legacyBaseline || platformChanged
   if (legacyBaseline) {
     log('warn', `基线是旧格式（${state.baseline?.version ?? '?'}，来自本机指纹），按「无基线」重新落基点`)
   }
@@ -952,12 +978,12 @@ async function main() {
   // 因为客户端被换成旧构建同样可能让插件的私有接口失效。
   let versionChanged = false
   // 版本是否真的不一致（跟「这一轮有没有报出来」分开：去重会让事件为 0）。
-  const mismatch = judgedVersion !== null && !firstRun && !legacyBaseline
+  const mismatch = judgedVersion !== null && !firstRun && !reanchor
     && state.baseline.version !== judgedVersion
   if (judgedVersion === null) {
     // 两路都拿不到版本就**什么都不做**：不推进基线、不报事件、不挂提示。
     log('warn', `读取接口版本失败: ${upstream.error} —— 本轮不判定`)
-  } else if (firstRun || legacyBaseline) {
+  } else if (firstRun || reanchor) {
     log('info', `落基线：${sources === 'both' ? '接口与文件名一致' : '仅接口'} 版本 ${judgedVersion}（不报警）`)
   } else if (mismatch) {
     const recorded = state.baseline.version
@@ -1103,6 +1129,8 @@ async function main() {
     if (judgedVersion !== null && !simulated && !MODE_CHECK) {
       state.baseline = {
         version: judgedVersion,
+        /** 这个数是在哪个平台上取的。跨平台比版本号没有意义。 */
+        platformId: PLATFORM_ID,
         /** 这个数是被几路确认过的：both / interface / link。 */
         source: sources === 'both' ? 'interface+link' : sources,
         linkFile: link.ok ? link.filename : null,
@@ -1167,6 +1195,7 @@ async function main() {
      */
     state.lastJudge = {
       at: nowIso(),
+      platformId: PLATFORM_ID,
       sources,
       interfaceVersion: ifaceVersion,
       linkVersion,
@@ -1197,8 +1226,15 @@ async function main() {
     checkedAt: nowIso(),
     firstRun,
     legacyBaseline,
+    platformChanged,
+    platformId: PLATFORM_ID,
     baseline: state.baseline
-      ? { version: state.baseline.version, source: state.baseline.source ?? null, updatedAt: state.baseline.updatedAt ?? null }
+      ? {
+        version: state.baseline.version,
+        platformId: state.baseline.platformId ?? null,
+        source: state.baseline.source ?? null,
+        updatedAt: state.baseline.updatedAt ?? null,
+      }
       : null,
     upstream: upstream.ok
       ? {
@@ -1236,7 +1272,7 @@ async function main() {
     note: events.length === 0
       ? (judgedVersion === null
         ? '本轮不判定（读不到接口版本）'
-        : (firstRun || legacyBaseline
+        : (firstRun || reanchor
           ? '落基线，不报警'
           : (mismatch ? '版本不一致，但这条事件已提示过（不重复弹）' : '无变化（判定版本等于基线）')))
       : (disableResult?.changed
