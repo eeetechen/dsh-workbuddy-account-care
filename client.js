@@ -1,9 +1,20 @@
 /**
  * WorkBuddy 版本守卫 —— 浏览器半。
  *
- * 只做一件事：在 `shell.overlay` 里画一条持久水印。值来自 Host 的
- * `/plugins/dsh-workbuddy-guard/state`，轮询间隔比 Host 那边松（30 秒）——
- * 水印晚 30 秒出现没有任何代价，而每分钟多打两次请求是看得见的。
+ * 只做两件事：
+ *   1. 从 Host 的 `/plugins/dsh-workbuddy-guard/state` 取「当前该不该有水印、写什么」；
+ *   2. 自己判断「现在有没有 workbuddy 会话在跑」，只有跑着的时候才把水印画出来。
+ *
+ * 为什么第 2 件事放在浏览器而不是 Host：`running` 是会话级的瞬时状态，Host 每 15 秒
+ * 才轮询一次文件，等它把「刚起跑 / 刚停」传回来，水印早就滞后了；而浏览器这半本来就
+ * 订阅着会话列表（`sessions.list`），拿到的是实时值，切 provider、起停一轮立刻就有反应。
+ *
+ * 显示规则（与产品约定一致）：
+ *   - **有 workbuddy 系 provider 的会话正在运行** → 全局显示；
+ *   - 没有 → 不显示（哪怕 guard.json 里还留着水印内容）；
+ *   - 「知道了」只是先收起来：只要还有 workbuddy 会话在跑，过一会儿它会带入场动画
+ *     重新浮现；等没有会话在跑时再点，就不会再冒出来；
+ *   - workbuddy-connect 更新（revision 变化）是一切的复位点。
  *
  * 设计取舍：
  *   - 用 `shell.overlay`（frame 级浮层，在每一列之上、不在滚动容器里），
@@ -32,10 +43,13 @@ window.__ModuleLoader__.load({
 
     const STATE_URL = '/plugins/dsh-workbuddy-guard/state'
     const POLL_MS = 30_000
-    const DISMISS_KEY = 'dsh-workbuddy-guard:dismissed'
     const STYLE_ID = 'dsh-workbuddy-guard:styles'
     /** 退场动画时长；到点再真正卸载卡片。 */
     const LEAVE_MS = 180
+    /** 「知道了」之后隔多久重新浮出来（前提：仍有 workbuddy 会话在跑）。 */
+    const RESHOW_MS = 1800
+    /** 被守卫的 provider 前缀，与 index.js 的 GUARDED_PROVIDERS 保持一致。 */
+    const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
 
     /**
      * 每种级别对应的强调色。
@@ -220,41 +234,89 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 「知道了」只对**同一条**水印有效：把 revision 记进 localStorage，
-     * revision 一变就重新显示。用户关掉的是这条消息，不是这个能力。
+     * 有没有「正在跑的 workbuddy 会话」。
+     *
+     * 数据直接来自浏览器的会话列表：`running` 是 Host 给的实时状态，
+     * `projectionValues.modelSelection` 是该会话当前的 provider。两者都是现成的，
+     * 不需要再向 Host 要一个专用接口，也不需要等 15 秒的文件轮询。
+     *
+     * `next` 优先于 `lastUsed`：刚切过去还没发消息时，`next` 才是「你现在打算用谁」。
      */
-    function useDismissed(revision) {
-      const [dismissed, setDismissed] = React.useState(false)
+    function useGuardedSessionsRunning(sessions) {
+      // 拿不到会话服务 → 不知道谁在跑，退回「保守显示」，别让守卫静默失效
+      const [running, setRunning] = React.useState(sessions === undefined || sessions === null)
       React.useEffect(() => {
-        if (revision === undefined || revision === null) { setDismissed(false); return }
-        try {
-          setDismissed(window.localStorage.getItem(DISMISS_KEY) === String(revision))
-        } catch { setDismissed(false) }
-      }, [revision])
-      const dismiss = React.useCallback(() => {
-        try { window.localStorage.setItem(DISMISS_KEY, String(revision)) } catch { /* 隐私模式 */ }
-        setDismissed(true)
-      }, [revision])
-      return [dismissed, dismiss]
+        if (sessions === undefined || sessions === null) return
+        const read = () => {
+          let found = false
+          try {
+            const snap = sessions.list.getSnapshot()
+            for (const id of snap.ids) {
+              const row = snap.byId[id]
+              if (row === undefined || row.running !== true) continue
+              const selection = row.projectionValues?.modelSelection
+              const pick = selection?.next ?? selection?.lastUsed
+              if (pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)) {
+                found = true
+                break
+              }
+            }
+          } catch { found = false }
+          setRunning(found)
+        }
+        read()
+        return sessions.list.subscribe(read)
+      }, [sessions])
+      return running
     }
 
-    function Watermark() {
+    /**
+     * 水印的显示状态机。
+     *
+     * 规则（用户约定）：
+     *   - 有 workbuddy 会话在跑 → 显示；没有 → 不显示（哪怕 guard.json 里还留着内容）；
+     *   - 「知道了」只是收起来一会儿：只要还有 workbuddy 会话在跑，`RESHOW_MS` 后
+     *     带入场动画重新浮出；等没有会话在跑时点，就安静地不再冒出来；
+     *   - revision 变化（workbuddy-connect 更新）是复位点。
+     *
+     * 也就是说，**「知道了」不会永久关掉一个正在发生的风险**，它只负责把眼前这块
+     * 玻璃收走一秒半。真正让它停下来的，是风险本身消失（没有 workbuddy 会话在跑）。
+     */
+    function Watermark({ sessions }) {
       const state = useGuardState()
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
-      const [dismissed, dismiss] = useDismissed(watermark === null ? null : revision)
+      const running = useGuardedSessionsRunning(sessions)
+
+      /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
+      const [snoozedRevision, setSnoozedRevision] = React.useState(null)
       const [leaving, setLeaving] = React.useState(false)
       const leaveTimer = React.useRef()
+      const reshowTimer = React.useRef()
 
-      // 新的水印（revision 变了）重新播一次入场动画
-      React.useEffect(() => { setLeaving(false) }, [revision])
+      /** 当前这条水印被用户收起过、并且还没到该重新出现的时候。 */
+      const snoozed = snoozedRevision !== null && snoozedRevision === revision
+
+      // 没有 workbuddy 会话在跑了 → 解除收起，下次再跑起来时重新提示
+      React.useEffect(() => {
+        if (!running && snoozed) setSnoozedRevision(null)
+      }, [running, snoozed])
+
+      // revision 变了（插件更新）→ 一切复位，重新播入场动画
+      React.useEffect(() => {
+        setSnoozedRevision(null)
+        setLeaving(false)
+      }, [revision])
+
       React.useEffect(() => () => {
         if (leaveTimer.current !== undefined) clearTimeout(leaveTimer.current)
+        if (reshowTimer.current !== undefined) clearTimeout(reshowTimer.current)
       }, [])
 
       React.useEffect(() => { ensureStyles() }, [])
 
-      if (watermark === null || dismissed) return null
+      const visible = watermark !== null && running && !snoozed
+      if (!visible) return null
 
       const accent = accentFor(watermark.level)
 
@@ -274,7 +336,14 @@ window.__ModuleLoader__.load({
 
       const onDismiss = () => {
         setLeaving(true)
-        leaveTimer.current = setTimeout(() => { dismiss() }, LEAVE_MS)
+        leaveTimer.current = setTimeout(() => {
+          setSnoozedRevision(revision)
+          setLeaving(false)
+          // 还有会话在跑 → 过一会儿重新浮出来；没有就不排这一班车
+          reshowTimer.current = setTimeout(() => {
+            setSnoozedRevision((current) => (current === revision ? null : current))
+          }, RESHOW_MS)
+        }, LEAVE_MS)
       }
 
       return h('div', { className: 'dsh-wbg-root' }, h('div', {
@@ -299,15 +368,20 @@ window.__ModuleLoader__.load({
       }, '知道了')))
     }
 
+    /** `sessions` 是可选的：拿不到就退回「只看 guard.json」的老行为，不至于白屏。 */
+    let clientSessions
+
     return {
-      inject: ['slots'],
+      // `sessions` 用来判断「有没有 workbuddy 会话在跑」；不声明 inject 时 ctx.get 拿不到它
+      inject: ['slots', 'sessions'],
       apply(ctx) {
         ensureStyles()
+        clientSessions = ctx.get('sessions')
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
           id: 'dsh-workbuddy-guard',
           order: 100,
-        }, Watermark))
+        }, () => h(Watermark, { sessions: clientSessions })))
       },
     }
   },
