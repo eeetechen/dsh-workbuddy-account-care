@@ -68,8 +68,14 @@ function cmdStatus() {
     say(`state dir   ${STATE_DIR}`)
     process.exit(0)
   }
-  say(`baseline    ${v.baselineVersion ?? '(none — 下一轮自动落基线)'}${v.baselineAt ? `  @ ${v.baselineAt}` : ''}`)
-  say(`source      ${v.upstreamUrl ?? '(default)'}`)
+  say(`baseline    ${v.baselineVersion ?? '(none — 下一轮自动落基线)'}`
+    + `${v.baselineSource ? `  (${v.baselineSource})` : ''}${v.baselineAt ? `  @ ${v.baselineAt}` : ''}`)
+  const j = v.lastJudge
+  if (j) {
+    say(`last judge  interface ${j.interfaceVersion ?? '?'} / filename ${j.linkVersion ?? '?'}`
+      + `  → ${j.judgedVersion ?? '不做判定'}${j.versionGap ? '  (两路不一致，取高者)' : ''}`)
+  }
+  say(`endpoint    ${v.upstreamUrl ?? '(default)'}  [${v.platform ?? '?'}]`)
   say(`guard pkg   ${v.pluginInstalled ?? '(not installed)'}`)
   say(`plugin on   ${v.bundleSelected === true ? 'yes' : v.bundleSelected === false ? 'NO (disabled)' : 'unknown'}`)
   say(`watermark   ${v.watermark ? v.watermark.title : 'none'}`)

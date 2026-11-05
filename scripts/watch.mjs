@@ -7,14 +7,19 @@
  * `dsh-connect-workbuddy` / 弹桌面通知。
  *
  * 唯一数据源：`https://www.workbuddy.cn/v2/update?platform=<platform>`
- *   取响应里的 productVersion（形如 5.9.3.42398134）。可用环境变量
- *   WORKBUDDY_WATCH_UPSTREAM（整个 URL）或 WORKBUDDY_WATCH_PLATFORM（平台串）覆盖。
+ *   从响应里取出两个版本号，**取高者**作为判定依据：
+ *     1. `productVersion`（形如 5.9.3.42398134）—— 接口自己报的
+ *     2. `url` 的文件名里的版本号 —— 例如
+ *        …/darwin-x64/WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg
+ *        只切字符串解析文件名，**不下载**（见 parseDownloadFilename）。
+ *   两个数不一致时不投票：谁高按谁算，低的那个记一条日志。
+ *   可用 WORKBUDDY_WATCH_UPSTREAM（整个 URL）或 WORKBUDDY_WATCH_PLATFORM 覆盖。
  *
  * **刻意不读本机安装**。
  *   早先的判据是扫描 app.asar / 内置插件 build id / cli/product.json 拼成一个
  *   指纹，问题有两个：一是每个平台的安装布局不一样（deb 在 /opt，macOS 在
  *   .app/Contents），漏读就静默降级；二是「同版本重装、asar 大小变了一点」这种
- *   与版本无关的改动也会触发。现在判据只有一个数字：接口版本 ≠ 记录版本。
+ *   与版本无关的改动也会触发。现在判据只有一个数字：判定版本 ≠ 记录版本。
  *   代价是：读不到接口就无法判定——本轮直接跳过，绝不猜、绝不误停用。
  *
  * 基点（baseline）与重锚：
@@ -121,6 +126,11 @@ const CLEAR_WATERMARK = flag('--clear-watermark')
  * `--simulate-local` 是历史名字（那时判定还在读本机安装），保留为别名。
  */
 const SIMULATE_VERSION = opt('--simulate-version', null) ?? opt('--simulate-local', null)
+/**
+ * 演练：把接口返回的下载链接换成这个，用来看「文件名里的版本」那一路解析得对不对。
+ * 显式给一个和 --simulate-version 不一致的链接，就能验证「取高者」的分支。
+ */
+const SIMULATE_URL = opt('--simulate-url', null)
 const SIMULATE_PLUGIN = opt('--simulate-plugin', null)
 const PROFILE = opt('--profile', DEFAULT_PROFILE)
 const PROFILE_DIR = opt('--profile-dir', join(DSH_HOME, 'profiles', PROFILE))
@@ -286,6 +296,68 @@ async function readUpstream() {
     }
   } catch (error) {
     return { ok: false, error: error?.name === 'TimeoutError' ? 'timeout' : String(error?.message || error) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 下载链接：只解析文件名里的版本号，绝不下载
+// ---------------------------------------------------------------------------
+
+/**
+ * 本机的「文件名平台串」，例如 darwin-x64 / linux-x64 / win32-x64。
+ *
+ * 上游的平台标识是 `workbuddy-darwin-x64` / `workbuddy-linux-x64-deb` /
+ * `workbuddy-win32-x64-user`，而安装包文件名里只带 `darwin-x64` 这一段。
+ * 剥掉前缀和后缀，两者才能对上。
+ */
+function expectedFilenamePlatform() {
+  const m = guessUpstreamPlatform().toLowerCase().match(/^workbuddy-([a-z0-9]+-[a-z0-9]+)/)
+  return m ? m[1] : null
+}
+
+/**
+ * 从下载链接里取出文件名与版本号。
+ *
+ * **纯字符串处理**：不发请求、不读文件、不校验 sha256。这个守卫每 3 分钟跑
+ * 一次，为了「确认自己没看错」去拖 180MB 的安装包显然不合理；而文件名本身
+ * 就是发布流水线的产物，格式稳定（实测两个平台都是这个形状）：
+ *
+ *   …/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg
+ *   …/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.zip
+ *                                   └── 平台 ──┘ └─── 版本 ───┘ └ 构建 ┘ └扩展┘
+ *
+ * 同一版本会同时挂 .dmg / .zip（其它平台是 .deb / .exe / .AppImage），所以
+ * 扩展名不参与判定——版本号才参与。
+ */
+function parseDownloadFilename(rawUrl) {
+  if (!rawUrl) return { ok: false, error: 'no-url' }
+  let filename
+  try {
+    const parsed = new URL(rawUrl)
+    const segs = parsed.pathname.split('/').filter(Boolean)
+    filename = decodeURIComponent(segs[segs.length - 1] ?? '')
+  } catch {
+    return { ok: false, error: 'bad-url', url: rawUrl }
+  }
+  if (!filename) return { ok: false, error: 'no-filename', url: rawUrl }
+
+  /**
+   * 版本号是 4 段数字（5.9.3.42398134）：前两段是语义版本，第三段是产品
+   * 版本号，第四段是构建号。构建哈希（如 d4692421）是十六进制、不含点，
+   * 不会被这条正则误抓。
+   */
+  const m = filename.match(/(\d+\.\d+\.\d+\.\d+)/)
+  const ext = (filename.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? '').toLowerCase()
+  const expected = expectedFilenamePlatform()
+  return {
+    ok: Boolean(m),
+    ...(m ? { version: m[1] } : { error: 'no-version-in-filename' }),
+    filename,
+    ext,
+    url: rawUrl,
+    /** 文件名里有没有本机的平台串。对不上说明这份链接不是给这台机器的。 */
+    platformOk: expected ? filename.toLowerCase().includes(expected) : null,
+    expectedPlatform: expected,
   }
 }
 
@@ -688,7 +760,11 @@ async function main() {
       bundleSelected: bundleSelected(),
       baselineVersion: state.baseline?.version ?? null,
       baselineAt: state.baseline?.updatedAt ?? null,
+      baselineSource: state.baseline?.source ?? null,
+      baselineLinkFile: state.baseline?.linkFile ?? null,
       upstreamUrl: UPSTREAM_URL,
+      platform: expectedFilenamePlatform(),
+      lastJudge: state.lastJudge ?? null,
       pluginInstalled: plugin.version,
       pluginDeclared: plugin.declared ?? null,
       pluginSeen: state.pluginSeen?.version ?? null,
@@ -754,17 +830,85 @@ async function main() {
   }
 
   /**
-   * 唯一数据源：上游接口。
+   * 数据源：上游接口的**两个字段**，取高者。
    *
-   * 这里**不再**读本机安装（app.asar / dpkg / 内置 build id / git commit 全部
-   * 删掉了）。理由见文件头：判据只要一个数字，越少的读取路径越难误判。
+   *   1. `productVersion`          —— 接口自己报的版本
+   *   2. `url` 文件名里的版本       —— 即将发布的那份安装包叫什么
+   *                                   （只解析文件名，绝不下载）
+   *
+   * 为什么不是「必须一致」：发布是不同步的。清单先改、CDN 上的文件名晚几分钟
+   * 跟上（或者反过来）是常态，要求一致就等于每次发版都要多等一个检查周期，
+   * 其间两个字段谁也不认。取高者的含义很直接——**谁先说新版本，就按谁算**，
+   * 另一边只记一条日志供排查。
+   *
+   * 本机安装仍然一个字节都不读（见文件头）。
    */
   const simulated = SIMULATE_VERSION !== null
   const upstream = simulated
-    ? { ok: true, version: SIMULATE_VERSION, url: null, publishedAt: null, simulated: true }
-    // 演练时**不联网**：既快，也能在没有外网的机器上验证整条链路。
+    ? {
+      ok: true,
+      version: SIMULATE_VERSION,
+      // 演练时**不联网**：既快，也能在没有外网的机器上验证整条链路。
+      // 同时造一个形状真实的链接，好让文件名解析那一路也被真的走一遍。
+      url: SIMULATE_URL ?? `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform()}/`
+        + `WorkBuddy-${expectedFilenamePlatform()}-${SIMULATE_VERSION}-d4692421.zip`,
+      publishedAt: null,
+      simulated: true,
+    }
     : await readUpstream()
   if (simulated) log('warn', `演练模式：把接口版本当成 ${SIMULATE_VERSION}（不联网、不推进基线）`)
+  if (!simulated && SIMULATE_URL !== null) {
+    upstream.url = SIMULATE_URL
+    log('warn', `演练模式：把下载链接换成 ${SIMULATE_URL}`)
+  }
+
+  // ---- 两路版本号，按高者取 ----------------------------------------------
+  const link = parseDownloadFilename(upstream.url)
+  const ifaceVersion = upstream.ok ? upstream.version : null
+  const linkVersion = link.ok ? link.version : null
+  /**
+   * `sources`：
+   *   both      —— 接口字段和文件名都解析出了版本
+   *   interface —— 没拿到/没解析出链接，只有接口这一路
+   *   link      —— 只有文件名这一路（接口没给版本，实际不会发生，留着兜底）
+   *   none      —— 两路都没有
+   *
+   * **两路不一致时不投票、不弃权，直接取高的那个。**
+   * 理由：这两个数都是「已经发布了什么」的证词，而发布过程本身是不同步的
+   * ——清单先变、CDN 上的文件名后变（或反过来）是常态。取高者等于「谁先
+   * 说新版本，就按谁算」，宁可早一点提醒，也不要因为另一路还停在旧值而
+   * 漏掉一次真实更新。低的那一路只记一条日志，供排查用。
+   */
+  let sources
+  let judgedVersion = null
+  let versionGap = null
+  if (ifaceVersion !== null && linkVersion !== null) {
+    sources = 'both'
+    const cmp = compareVersions(ifaceVersion, linkVersion)
+    judgedVersion = cmp >= 0 ? ifaceVersion : linkVersion
+    if (cmp !== 0) {
+      versionGap = { interfaceVersion: ifaceVersion, linkVersion, picked: judgedVersion }
+    }
+  } else if (ifaceVersion !== null) {
+    sources = 'interface'
+    judgedVersion = ifaceVersion
+  } else if (linkVersion !== null) {
+    sources = 'link'
+    judgedVersion = linkVersion
+  } else {
+    sources = 'none'
+  }
+
+  if (link.ok && link.platformOk === false) {
+    // 只提醒、不拦：文件名拼法偶尔会变，为这个停下判定不值得。
+    log('warn', `下载链接的平台串不是本机的（期望 ${link.expectedPlatform}）：${link.filename}`)
+  }
+  if (sources === 'interface') {
+    log('warn', `没拿到可解析的下载链接（${link.error ?? 'unknown'}），本轮只看接口版本`)
+  }
+  if (versionGap) {
+    log('warn', `接口与文件名版本不一致（接口 ${ifaceVersion} / 文件名 ${linkVersion}），按高者取 ${judgedVersion}`)
+  }
 
   const config = effectiveConfig()
 
@@ -779,10 +923,13 @@ async function main() {
    * 版本（如 5.9.3.42398134）根本不是一个体系。直接比必然对不上，于是规则切换
    * 的那一刻会凭空弹一次「更新了」。
    *
-   * 所以：发现 baseline 不是 upstream 口径，就把它当「没有基线」——这一轮
-   * 静默重锚到接口当前值，不报事件、不挂水印。
+   * 所以：发现 baseline 里**没有 `source` 标记**（= 老格式），就把它当「没有
+   * 基线」——这一轮静默重锚到当前值，不报事件、不挂水印。
+   *
+   * 有 `source` 的都是新口径（`interface+link` / `interface` / `link`），
+   * 原样沿用，不重锚。
    */
-  const legacyBaseline = Boolean(state.baseline) && state.baseline?.source !== 'upstream'
+  const legacyBaseline = Boolean(state.baseline) && state.baseline?.source === undefined
   if (legacyBaseline) {
     log('warn', `基线是旧格式（${state.baseline?.version ?? '?'}，来自本机指纹），按「无基线」重新落基点`)
   }
@@ -805,24 +952,29 @@ async function main() {
   // 因为客户端被换成旧构建同样可能让插件的私有接口失效。
   let versionChanged = false
   // 版本是否真的不一致（跟「这一轮有没有报出来」分开：去重会让事件为 0）。
-  const mismatch = upstream.ok && !firstRun && !legacyBaseline
-    && state.baseline.version !== upstream.version
-  if (!upstream.ok) {
-    // 读不到接口就**不判定**：既不推进基线，也不报事件。下一轮再试。
+  const mismatch = judgedVersion !== null && !firstRun && !legacyBaseline
+    && state.baseline.version !== judgedVersion
+  if (judgedVersion === null) {
+    // 两路都拿不到版本就**什么都不做**：不推进基线、不报事件、不挂提示。
     log('warn', `读取接口版本失败: ${upstream.error} —— 本轮不判定`)
   } else if (firstRun || legacyBaseline) {
-    log('info', `落基线：接口版本 ${upstream.version}（不报警）`)
+    log('info', `落基线：${sources === 'both' ? '接口与文件名一致' : '仅接口'} 版本 ${judgedVersion}（不报警）`)
   } else if (mismatch) {
     const recorded = state.baseline.version
     versionChanged = pushEvent({
       at: nowIso(),
       kind: 'wb-version-changed',
       from: recorded,
-      to: upstream.version,
+      to: judgedVersion,
       action: config.disableOnHit ? 'disable-bundle' : 'report-only',
-      url: upstream.url ?? null,
+      url: link.ok ? link.url : (upstream.url ?? null),
+      interfaceVersion: ifaceVersion,
+      linkVersion,
     })
-    if (versionChanged) log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → 接口 ${upstream.version}`)
+    if (versionChanged) {
+      log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → ${judgedVersion}`
+        + `（接口 ${ifaceVersion ?? '?'}，文件名 ${linkVersion ?? '?'}）`)
+    }
   }
 
   // 3) 插件自身版本 —— 有新版就地升级，并挂「重启生效」水印
@@ -948,12 +1100,14 @@ async function main() {
      * 另外：命中版本变化时也照样推进——同一版本不该反复弹提示。去重还有
      * reportedKeys（kind|from|to）兜底。
      */
-    if (upstream.ok && !simulated && !MODE_CHECK) {
+    if (judgedVersion !== null && !simulated && !MODE_CHECK) {
       state.baseline = {
-        version: upstream.version,
-        source: 'upstream',
+        version: judgedVersion,
+        /** 这个数是被几路确认过的：both / interface / link。 */
+        source: sources === 'both' ? 'interface+link' : sources,
+        linkFile: link.ok ? link.filename : null,
         ...(state.baseline?.capturedAt ? { capturedAt: state.baseline.capturedAt } : {}),
-        ...(state.baseline?.version === upstream.version ? {} : { changedAt: nowIso() }),
+        ...(state.baseline?.version === judgedVersion ? {} : { changedAt: nowIso() }),
         updatedAt: nowIso(),
       }
     } else if (simulated) {
@@ -1005,10 +1159,26 @@ async function main() {
     }
     state.checks = (state.checks ?? 0) + 1
     state.lastCheckAt = nowIso()
+    /**
+     * 最近一次「两路判定」的结果。
+     *
+     * `--status` 不联网，所以它没法现场再解析一遍；把上一次的结论留在
+     * state 里，排查「到底是哪一路看到的新版本」就不用翻日志。
+     */
+    state.lastJudge = {
+      at: nowIso(),
+      sources,
+      interfaceVersion: ifaceVersion,
+      linkVersion,
+      linkFile: link.ok ? link.filename : null,
+      /** 最终采信的版本（两路不一致时取高者）。 */
+      judgedVersion,
+      versionGap,
+    }
     state.lastUpstreamError = upstream.ok ? null : upstream.error
     state.lastPluginError = pluginLatest.ok || NO_UPGRADE ? null : pluginLatest.error
     writeJsonAtomic(STATE_FILE, state)
-    log('info', `检查 #${state.checks}：接口 ${upstream.ok ? upstream.version : `读取失败(${upstream.error})`}${simulated ? '(模拟)' : ''}，基线 ${state.baseline?.version ?? '?'}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
+    log('info', `检查 #${state.checks}：接口 ${ifaceVersion ?? `读取失败(${upstream.error})`}，文件名 ${linkVersion ?? `未解析(${link.error})`}，判定 ${judgedVersion ?? '不做'}${simulated ? '(模拟)' : ''}，基线 ${state.baseline?.version ?? '?'}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
   }
 
   // 5) 通知（只在真的停用、待用户确认、或插件自升级时弹）
@@ -1038,6 +1208,14 @@ async function main() {
         simulated,
       }
       : { error: upstream.error },
+    /** 从下载链接文件名里解析出来的那一路。 */
+    link: link.ok
+      ? { version: link.version, filename: link.filename, ext: link.ext, platformOk: link.platformOk }
+      : { error: link.error ?? null },
+    sources,
+    judgedVersion,
+    /** 两路不一致时：谁低、谁被采信。一致时为 null。 */
+    versionGap,
     plugin: {
       installed: installedVersion ?? null,
       declared: pluginBefore.declared ?? null,
@@ -1056,11 +1234,11 @@ async function main() {
     bundleSelected: bundleSelected(),
     pendingReport: (state.pendingReport ?? []).length,
     note: events.length === 0
-      ? (!upstream.ok
+      ? (judgedVersion === null
         ? '本轮不判定（读不到接口版本）'
         : (firstRun || legacyBaseline
           ? '落基线，不报警'
-          : (mismatch ? '版本不一致，但这条事件已提示过（不重复弹）' : '无变化（接口版本与基线一致）')))
+          : (mismatch ? '版本不一致，但这条事件已提示过（不重复弹）' : '无变化（判定版本等于基线）')))
       : (disableResult?.changed
         ? `已停用 ${BUNDLE}，已挂水印并下发软结束指令`
         : (pluginUpgrade?.upgraded ? '插件已升级，已挂重启水印' : '见 disableResult/plugin')),

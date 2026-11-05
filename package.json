@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "WorkBuddy 版本守卫：dsh-connect-workbuddy 的配套辅助插件。按 WorkBuddy 官方接口的版本号与本地基线比对，不一致就提示并停用 dsh-connect-workbuddy、软结束正在用它的会话，并在界面顶部挂持久水印；同时自动升级 dsh-connect-workbuddy 自身。",
+  "description": "WorkBuddy 版本守卫：dsh-connect-workbuddy 的配套辅助插件。按 WorkBuddy 官方接口字段与安装包文件名解析出的版本号（取高者）与本地基线比对，不一致就提示并停用 dsh-connect-workbuddy、软结束正在用它的会话，并在界面顶部挂持久水印；同时自动升级 dsh-connect-workbuddy 自身。",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",

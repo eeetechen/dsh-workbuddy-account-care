@@ -49,8 +49,9 @@ dsh plugin --profile web add dsh-workbuddy-guard
 | **`dsh-connect-workbuddy` 在 npm 上有新版** | 自动升级 + 橙色水印提示重启 DSH |
 | 什么都没有 | 静默，只写一行日志 |
 
-判断依据只有一个数字：**官方接口报的版本号 ≠ 本地记录的基线版本号**。规则很硬，
+判断依据只有一个数字：**接口报的版本号 ≠ 本地记录的基线版本号**。规则很硬，
 没有「可能」、「大概」、「指纹相近」——对不上就是变了，对上就什么都不做。
+而这个版本号本身取自**两处**：接口字段、安装包文件名，取高者（见下）。
 
 ## 判定数据源
 
@@ -70,8 +71,35 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 }
 ```
 
-脚本只取 `productVersion`（没有时退回 `version`），与 `state.json` 的
-`baseline.version` 做**字符串比较**：不等就报一次「版本不一致」。
+从这条响应里取**两个**版本号：
+
+| # | 来源 | 例子 |
+|---|---|---|
+| 1 | `productVersion`（没有时退回 `version`） | `5.9.3.42398134` |
+| 2 | `url` 的**文件名**里的版本号 | `WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg` → `5.9.3.42398134` |
+
+两者取**高的那个**，再与 `state.json` 的 `baseline.version` 做**字符串比较**：
+不等就报一次「版本不一致」。
+
+链接按平台给，脚本只按本机平台去解析文件名，格式是稳定的一段：
+
+```
+…/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg
+                                  └── 平台 ──┘ └─── 版本 ───┘ └ 构建 ┘ └扩展┘
+```
+
+`.dmg` / `.zip` 是同一版本的两个包（其它平台是 `.deb` / `.exe` / `.AppImage`），
+所以**扩展名不参与判定**，版本号才参与。同一版本号有 4 段数字，最后一段是构建号；
+构建哈希（`d4692421`）是十六进制、不含点，不会被误认成版本。
+
+> **只解析，不下载。** 这个守卫每 3 分钟跑一次，为了一句「没看错」去拖 180MB
+> 的安装包显然不合理。解析是纯字符串操作：拆 URL、取最后一段、跑一条正则。
+> 它也不会对链接发 HEAD 或任何请求。
+
+**两处不一致时取高者，不投票。** 发布是不同步的——清单先改、CDN 上的文件名
+晚几分钟跟上（或者反过来）是常态。要求两者一致，等于每次发版都要白等一个检查
+周期；取高者的含义很直接：**谁先说新版本，就按谁算**。低的那一路只记一条
+`warn` 日志，`--status` 的 `lastJudge.versionGap` 里也能看到，方便排查。
 
 **刻意不读本机安装。** 早先的版本靠在客户端的安装目录里翻 `app.asar` 的
 `package.json`、内置插件的 build id、`cli/product.json` 的 commit，拼成一个指纹。
@@ -220,9 +248,12 @@ npx dsh-workbuddy-guard where     # 各条路径 + 当前定时来源
 dsh-workbuddy-guard（Host 半）
   ├─ 每 3 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
-  │     ├─ 读 WorkBuddy 官方接口 /v2/update 的 productVersion
+  │     ├─ 读 WorkBuddy 官方接口 /v2/update，取出两路版本号
+  │     │   ├─ productVersion
+  │     │   ├─ url 文件名里的版本号（只解析，不下载）
+  │     │   └─ 取高者 = 判定版本
   │     ├─ 读 npm 上 dsh-connect-workbuddy 的 latest
-  │     ├─ 接口版本 ≠ 基线 → 写 guard.json（水印，等你选软结束/硬结束）
+  │     ├─ 判定版本 ≠ 基线 → 写 guard.json（水印，等你选软结束/硬结束）
   │     │                    基线随即推进，同一版本不会反复弹
   │     └─ npm 有新版本 → dsh plugin add 升级它，写「重启生效」水印
   │
@@ -324,7 +355,7 @@ node node_modules/dsh-workbuddy-guard/scripts/watch.mjs
 
 | 文件 | 内容 |
 |---|---|
-| `state.json` | 基线版本（`baseline.version`）、已见版本、事件去重 |
+| `state.json` | 基线版本（`baseline.version` / `source` / `linkFile`）、最近一次两路判定（`lastJudge`）、已见版本、事件去重 |
 | `guard.json` | 给插件的指令（水印 + 软结束），插件回写 `handled` |
 | `watch.log` | 每次检查一行 |
 | `config.json` | 策略（可选） |
