@@ -346,8 +346,15 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(null)
       /** 动作失败的原因，直接显示在卡片里。 */
       const [failed, setFailed] = React.useState(null)
-      /** 动作已成功 → 立刻收起，不等下一轮轮询。 */
-      const [finished, setFinished] = React.useState(false)
+      /**
+       * 动作成功时记下「我处理掉的是哪一个 revision」，只压制那一条。
+       *
+       * 早先这里是个裸布尔：置 true 之后永远不再复位，于是动作做完、你重新开启
+       * 插件并选中 WorkBuddy 时，水印被这个残留标记挡住——看起来像浏览器缓存，
+       * 其实是组件状态没跟着 revision 走。现在绑到 revision 上，Host 一抬高
+       * revision 它就自动失效。
+       */
+      const [finishedRevision, setFinishedRevision] = React.useState(null)
       const [leaving, setLeaving] = React.useState(false)
       const leaveTimer = React.useRef()
       const reshowTimer = React.useRef()
@@ -383,6 +390,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => { ensureStyles() }, [])
 
+      const finished = finishedRevision !== null && finishedRevision === revision
       const visible = watermark !== null && gateOpen && !snoozed && !finished
       if (!visible) return null
 
@@ -434,7 +442,7 @@ window.__ModuleLoader__.load({
           })
           const payload = await res.json().catch(() => ({}))
           if (!res.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${res.status}`)
-          setFinished(true)
+          setFinishedRevision(revision)
         } catch (error) {
           setFailed(String(error?.message ?? error))
         } finally {
