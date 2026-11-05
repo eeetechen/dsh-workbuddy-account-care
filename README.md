@@ -215,7 +215,7 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 的会话：
 
 1. `agent.cancel({ kind: 'hook' }, { keepInbox: true })` —— 中止当前轮，保留收件箱；
-2. `agent.followup(...)` —— 排一条「暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，不是你的输入。」
+2. `agent.followup(...)` —— 排一条「暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务」
 
 先 cancel 再 followup 是有意的：那条说明才会成为下一轮的唯一输入，而不是被
 这次中止一起丢掉。已经软结束过的会话不会重复插入（收件箱里有

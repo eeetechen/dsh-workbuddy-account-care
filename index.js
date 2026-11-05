@@ -204,7 +204,7 @@ function textOf(content) {
  * 这句话是给「下一轮的那个 agent」看的：它得知道三件事——现在该停下来、
  * 为什么停（本机 provider 变了）、以及这条消息不是用户本人写的。
  */
-const DEFAULT_STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，不是你的输入。'
+const DEFAULT_STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务'
 
 /**
  * 去重标记：收件箱里已经有这句话的会话，不再重复插一条。

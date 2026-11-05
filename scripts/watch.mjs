@@ -71,7 +71,7 @@ const BUNDLE = 'dsh-connect-workbuddy'
  * 与 index.js 的 DEFAULT_STOP_TEXT 保持一致：脚本总是写值，插件只是兜底，
  * 两处文案必须一样，否则「脚本写的」和「插件默认的」会在不同路径上出现分叉。
  */
-const STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，不是你的输入。'
+const STOP_TEXT = '暂停执行，等待重启 agent 工具。本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务'
 const HOME = process.env.HOME || process.env.USERPROFILE || homedir()
 const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
 const STATE_DIR = join(DSH_HOME, 'workbuddy-update-watch')
