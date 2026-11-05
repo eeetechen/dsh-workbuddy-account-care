@@ -7,7 +7,7 @@
  * —— DSH 没在跑的时候，也没有任何请求会被发出去，那时检查没有意义。
  *
  * 本文件只提供手动操作与排查：
- *   dsh-workbuddy-account-care status            # 守卫状态
+ *   dsh-workbuddy-account-care status            # 呵护插件状态
  *   dsh-workbuddy-account-care where             # 解析出的各条路径
  *   dsh-workbuddy-account-care check [args...]   # 立刻跑一次（参数透传给 watch.mjs）
  *
@@ -63,7 +63,7 @@ function cmdStatus() {
   const v = r.value
   if (v.targetInstalled === false) {
     say(`guard pkg   (not installed)`)
-    say(`status      SKIPPED — dsh-connect-workbuddy 未安装，守卫不做任何事`)
+    say(`status      SKIPPED — dsh-connect-workbuddy 未安装，呵护插件不做任何事`)
     say(`evidence    ${v.targetEvidence}`)
     say(`state dir   ${STATE_DIR}`)
     process.exit(0)
@@ -73,8 +73,13 @@ function cmdStatus() {
     + `${v.baselineSource ? `  (${v.baselineSource})` : ''}${v.baselineAt ? `  @ ${v.baselineAt}` : ''}`)
   const j = v.lastJudge
   if (j) {
-    say(`last judge  interface ${j.interfaceVersion ?? '?'} / filename ${j.linkVersion ?? '?'}`
-      + `  → ${j.judgedVersion ?? '不做判定'}${j.versionGap ? '  (两路不一致，取高者)' : ''}`)
+    say(`last judge  ${j.judgedVersion ?? '不做判定'}`
+      + `${Array.isArray(j.judgedFrom) && j.judgedFrom.length ? `  (来自 ${j.judgedFrom.map((x) => x.replace('workbuddy-', '')).join(' + ')})` : ''}`)
+  }
+  for (const row of j?.platforms ?? []) {
+    const tag = row.role === 'record' ? '记录' : '判定'
+    say(`  ${tag}  ${row.platform.replace('workbuddy-', '').padEnd(20)} ${String(row.version ?? `失败(${row.error})`).padEnd(18)}`
+      + `接口 ${row.interfaceVersion ?? '?'} / 文件 ${row.linkVersion ?? '?'}`)
   }
   say(`endpoint    ${v.upstreamUrl ?? '(default)'}  [${v.platform ?? '?'}]`)
   say(`guard pkg   ${v.pluginInstalled ?? '(not installed)'}`)

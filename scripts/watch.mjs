@@ -7,13 +7,19 @@
  * `dsh-connect-workbuddy` / 弹桌面通知。
  *
  * 唯一数据源：`https://www.workbuddy.cn/v2/update?platform=<platform>`
- *   从响应里取出两个版本号，**取高者**作为判定依据：
+ *
+ *   每个平台从响应里取出**两个**版本号，取高者：
  *     1. `productVersion`（形如 5.9.3.42398134）—— 接口自己报的
  *     2. `url` 的文件名里的版本号 —— 例如
  *        …/darwin-x64/WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg
  *        只切字符串解析文件名，**不下载**（见 parseDownloadFilename）。
- *   两个数不一致时不投票：谁高按谁算，低的那个记一条日志。
- *   可用 WORKBUDDY_WATCH_UPSTREAM（整个 URL）或 WORKBUDDY_WATCH_PLATFORM 覆盖。
+ *
+ *   每轮探**五个**平台，但只有三个参与判定：
+ *     判定：darwin-x64 / darwin-arm64 / win32-x64-user —— 取三者的高者
+ *     记录：linux-x64-deb / linux-arm64-deb —— 只写日志与 --status，不影响结论
+ *   为什么排除 linux：实测它整线滞后一个大版本段（5.6.2 vs 5.9.3），算进
+ *   「取高者」只会制造噪声；等官方三端对齐了再把它们加回 PLATFORMS_JUDGE。
+ *   可用 WORKBUDDY_WATCH_UPSTREAM（整个 URL，此时退化为只探本机平台）。
  *
  * **刻意不读本机安装**。
  *   早先的判据是扫描 app.asar / 内置插件 build id / cli/product.json 拼成一个
@@ -41,7 +47,7 @@
  *   - `watermark`     → 浏览器半在 shell.overlay 里画水印
  *   - `stopSessions`  → Host 半软结束「正在跑且在用 workbuddy」的会话
  * 停用 bundle 这件事**只由本脚本做**，插件不做——本插件加载失败时脚本照样
- * 能停用它，这是安全网不依赖被守卫对象的唯一办法。
+ * 能停用它，这是安全网不依赖被呵护插件对象的唯一办法。
  *
  * 用法：
  *   node workbuddy-update-watch.mjs                 # 检查；需要时停用 + 通知
@@ -98,15 +104,40 @@ function guessUpstreamPlatform() {
   return `workbuddy-linux-${arch}-deb`
 }
 /**
- * 本机对应的平台标识，同时也是**判定作用域**。
+ * **参与判定**的平台：macOS 两条 + Windows 一条。
  *
- * 这条很要紧：官方各平台不是同步发版的（实测 macOS/Windows 在 5.9.3，
- * Linux 全线还停在 5.6.2）。所以「版本号」只有在同一个 platform 下才有可比性，
- * 换一个 platform 去比，等于拿两个产品的版本号对撞。
+ * 实测这三条线是同步的：同一天、同一个 5.9.3.42398134、同一个构建哈希
+ * d4692421。也就是说它们描述的是同一件事实，取高者就是当前真实版本。
  */
+const PLATFORMS_JUDGE = [
+  'workbuddy-darwin-x64',
+  'workbuddy-darwin-arm64',
+  'workbuddy-win32-x64-user',
+]
+/**
+ * **只记录、不参与判定**的平台。
+ *
+ * Linux 线明显滞后（实测 5.6.2.40046327，比 mac/win 低一个大版本段），把它
+ * 算进「取高者」只会制造噪声。暂时排除，但仍然照抓——留证据，也让日志里
+ * 突然少一路这种事不会悄悄发生。
+ */
+const PLATFORMS_RECORD_ONLY = [
+  'workbuddy-linux-x64-deb',
+  'workbuddy-linux-arm64-deb',
+]
+/** 本机是哪个平台（只用于展示与日志，不再决定判定范围）。 */
 const PLATFORM_ID = guessUpstreamPlatform()
-const UPSTREAM_URL = process.env.WORKBUDDY_WATCH_UPSTREAM
-  || `https://www.workbuddy.cn/v2/update?platform=${PLATFORM_ID}`
+/**
+ * 覆盖上游地址。
+ *
+ * 自建镜像 / 内网代理时，这个地址通常已经绑定了某个平台，再拿它去问五个
+ * 平台没有意义，所以设了它就只探本机这一个平台。
+ */
+const CUSTOM_UPSTREAM = process.env.WORKBUDDY_WATCH_UPSTREAM || null
+
+function upstreamUrlFor(platformId) {
+  return CUSTOM_UPSTREAM ?? `https://www.workbuddy.cn/v2/update?platform=${platformId}`
+}
 
 // ---------------------------------------------------------------------------
 // 参数
@@ -283,28 +314,50 @@ function compareVersions(a, b) {
 }
 
 // ---------------------------------------------------------------------------
-// 上游最新版本
+// 上游最新版本（按平台）
 // ---------------------------------------------------------------------------
-async function readUpstream() {
+async function readPlatform(platformId, url) {
   try {
-    const res = await fetch(UPSTREAM_URL, {
+    const res = await fetch(url, {
       headers: { 'user-agent': 'dsh-workbuddy-update-watch/1.0' },
       signal: AbortSignal.timeout(15000),
     })
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` }
     const body = await res.json()
     const version = String(body.productVersion || body.version || '')
-    if (!version) return { ok: false, error: 'no version field' }
+    if (!version) return { ok: false, platformId, error: 'no version field' }
     return {
       ok: true,
+      platformId,
       version,
       url: body.url ?? null,
       sha256: body.sha256hash || null,
       publishedAt: body.timestamp ? new Date(body.timestamp * 1000).toISOString() : null,
     }
   } catch (error) {
-    return { ok: false, error: error?.name === 'TimeoutError' ? 'timeout' : String(error?.message || error) }
+    return {
+      ok: false,
+      platformId,
+      error: error?.name === 'TimeoutError' ? 'timeout' : String(error?.message || error),
+    }
   }
+}
+
+/**
+ * 这一轮要探测哪些平台。
+ *
+ * 默认五路：三条判定（darwin-x64 / darwin-arm64 / win32-x64-user）+ 两条
+ * 只记录（linux-x64-deb / linux-arm64-deb）。设了 WORKBUDDY_WATCH_UPSTREAM
+ * 就退化成单路（那个地址已经绑平台了）。
+ */
+function platformsToProbe() {
+  if (CUSTOM_UPSTREAM !== null) {
+    return [{ id: PLATFORM_ID, role: 'judge', url: CUSTOM_UPSTREAM }]
+  }
+  return [
+    ...PLATFORMS_JUDGE.map((id) => ({ id, role: 'judge' })),
+    ...PLATFORMS_RECORD_ONLY.map((id) => ({ id, role: 'record' })),
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -318,15 +371,15 @@ async function readUpstream() {
  * `workbuddy-win32-x64-user`，而安装包文件名里只带 `darwin-x64` 这一段。
  * 剥掉前缀和后缀，两者才能对上。
  */
-function expectedFilenamePlatform() {
-  const m = guessUpstreamPlatform().toLowerCase().match(/^workbuddy-([a-z0-9]+-[a-z0-9]+)/)
+function expectedFilenamePlatform(platformId = PLATFORM_ID) {
+  const m = String(platformId).toLowerCase().match(/^workbuddy-([a-z0-9]+-[a-z0-9]+)/)
   return m ? m[1] : null
 }
 
 /**
  * 从下载链接里取出文件名与版本号。
  *
- * **纯字符串处理**：不发请求、不读文件、不校验 sha256。这个守卫每 3 分钟跑
+ * **纯字符串处理**：不发请求、不读文件、不校验 sha256。这个呵护插件每 3 分钟跑
  * 一次，为了「确认自己没看错」去拖 180MB 的安装包显然不合理；而文件名本身
  * 就是发布流水线的产物，格式稳定（实测两个平台都是这个形状）：
  *
@@ -481,14 +534,14 @@ function enableBundle({ dryRun }) {
 /**
  * 本机到底有没有装 `dsh-connect-workbuddy`。
  *
- * 这是整套守卫的前置条件：**没装就什么都不做** —— 不停用、不升级、不挂水印、
- * 不软结束会话，连基线都不写。理由很直接：这个守卫存在的唯一目的是替一个
+ * 这是整套呵护插件的前置条件：**没装就什么都不做** —— 不停用、不升级、不挂水印、
+ * 不软结束会话，连基线都不写。理由很直接：这个呵护插件存在的唯一目的是替一个
  * 正在被使用的危险插件踩刹车；刹车片装在一辆不存在的车上没有意义，而且
  * 「自动升级 dsh-connect-workbuddy」在没有装它的时候会变成**凭空安装**，
  * 那是另一种越权。
  *
  * 「装了」的判据是**磁盘上有这个包**（node_modules/<pkg>/package.json），
- * 不是「bundle 被选中」：守卫自己会把它停用（从 bundles 里摘掉），那时它
+ * 不是「bundle 被选中」：呵护插件自己会把它停用（从 bundles 里摘掉），那时它
  * 仍然是「已安装、只是停用」，必须继续认得它，否则第二次检查就再也不会
  * 恢复判断了。
  */
@@ -730,7 +783,7 @@ async function main() {
         targetEvidence: target.evidence,
         guardFile: GUARD_FILE,
         stateFile: STATE_FILE,
-        note: `${BUNDLE} 未安装 —— 守卫不执行任何动作`,
+        note: `${BUNDLE} 未安装 —— 呵护插件不执行任何动作`,
       }
     }
     // 其它模式（含定时）一律安静退出：不写 state，不建基线，不碰 profile
@@ -771,7 +824,8 @@ async function main() {
       baselineAt: state.baseline?.updatedAt ?? null,
       baselineSource: state.baseline?.source ?? null,
       baselineLinkFile: state.baseline?.linkFile ?? null,
-      upstreamUrl: UPSTREAM_URL,
+      upstreamUrl: CUSTOM_UPSTREAM ?? 'https://www.workbuddy.cn/v2/update?platform=<各平台>',
+      platforms: state.platforms ?? null,
       platformId: PLATFORM_ID,
       platform: expectedFilenamePlatform(),
       lastJudge: state.lastJudge ?? null,
@@ -854,71 +908,96 @@ async function main() {
    * 本机安装仍然一个字节都不读（见文件头）。
    */
   const simulated = SIMULATE_VERSION !== null
-  const upstream = simulated
-    ? {
-      ok: true,
-      version: SIMULATE_VERSION,
-      // 演练时**不联网**：既快，也能在没有外网的机器上验证整条链路。
-      // 同时造一个形状真实的链接，好让文件名解析那一路也被真的走一遍。
-      url: SIMULATE_URL ?? `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform()}/`
-        + `WorkBuddy-${expectedFilenamePlatform()}-${SIMULATE_VERSION}-d4692421.zip`,
-      publishedAt: null,
-      simulated: true,
-    }
-    : await readUpstream()
-  if (simulated) log('warn', `演练模式：把接口版本当成 ${SIMULATE_VERSION}（不联网、不推进基线）`)
-  if (!simulated && SIMULATE_URL !== null) {
-    upstream.url = SIMULATE_URL
-    log('warn', `演练模式：把下载链接换成 ${SIMULATE_URL}`)
-  }
+  if (simulated) log('warn', `演练模式：把所有平台都当成 ${SIMULATE_VERSION}（不联网、不推进基线）`)
 
-  // ---- 两路版本号，按高者取 ----------------------------------------------
-  const link = parseDownloadFilename(upstream.url)
-  const ifaceVersion = upstream.ok ? upstream.version : null
-  const linkVersion = link.ok ? link.version : null
   /**
-   * `sources`：
-   *   both      —— 接口字段和文件名都解析出了版本
-   *   interface —— 没拿到/没解析出链接，只有接口这一路
-   *   link      —— 只有文件名这一路（接口没给版本，实际不会发生，留着兜底）
-   *   none      —— 两路都没有
+   * 探测平台矩阵，每个平台单独算「接口字段 vs 文件名」的版本。
    *
-   * **两路不一致时不投票、不弃权，直接取高的那个。**
-   * 理由：这两个数都是「已经发布了什么」的证词，而发布过程本身是不同步的
-   * ——清单先变、CDN 上的文件名后变（或反过来）是常态。取高者等于「谁先
-   * 说新版本，就按谁算」，宁可早一点提醒，也不要因为另一路还停在旧值而
-   * 漏掉一次真实更新。低的那一路只记一条日志，供排查用。
+   * 为什么要多平台：官方三端不是同步发版的，而且哪一端先动并不固定。只看
+   * 本机那一路，等于把「本机平台的发版节奏」当成「客户端的更新事实」；实测
+   * Linux 落后一个大版本段，一旦本机是 Linux 就会永远对不上。
+   *
+   * 所以：所有平台都探，但**只有 mac + win 参与判定**（见 PLATFORMS_JUDGE）。
+   * linux 两路只记录，出现在日志与 --status 里，不影响结论。
    */
-  let sources
-  let judgedVersion = null
-  let versionGap = null
-  if (ifaceVersion !== null && linkVersion !== null) {
-    sources = 'both'
-    const cmp = compareVersions(ifaceVersion, linkVersion)
-    judgedVersion = cmp >= 0 ? ifaceVersion : linkVersion
-    if (cmp !== 0) {
-      versionGap = { interfaceVersion: ifaceVersion, linkVersion, picked: judgedVersion }
+  const probes = platformsToProbe()
+  const platformResults = []
+  for (const probe of probes) {
+    const platformId = probe.id
+    const iface = simulated
+      ? {
+        ok: true,
+        platformId,
+        version: SIMULATE_VERSION,
+        // 演练不联网，但要造一个形状真实的链接，好让文件名解析那一路也真的跑一遍
+        url: SIMULATE_URL ?? `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(platformId)}/`
+          + `WorkBuddy-${expectedFilenamePlatform(platformId)}-${SIMULATE_VERSION}-d4692421.zip`,
+        publishedAt: null,
+        simulated: true,
+      }
+      : await readPlatform(platformId, probe.url ?? upstreamUrlFor(platformId))
+    // 演练「换链接」：只替换本机那一路，其它平台保持自洽
+    if (!simulated && SIMULATE_URL !== null && platformId === PLATFORM_ID) {
+      iface.url = SIMULATE_URL
+      log('warn', `演练模式：把 ${platformId} 的下载链接换成 ${SIMULATE_URL}`)
     }
-  } else if (ifaceVersion !== null) {
-    sources = 'interface'
-    judgedVersion = ifaceVersion
-  } else if (linkVersion !== null) {
-    sources = 'link'
-    judgedVersion = linkVersion
-  } else {
-    sources = 'none'
+
+    const link = parseDownloadFilename(iface.url)
+    if (link.ok && link.platformOk === false && probe.role === 'judge') {
+      // 只提醒、不拦：文件名拼法偶尔会变，为这个停下判定不值得。
+      log('warn', `下载链接的平台串对不上（${platformId}，期望 ${link.expectedPlatform}）：${link.filename}`)
+    }
+
+    const ifaceVersion = iface.ok ? iface.version : null
+    const linkVersion = link.ok ? link.version : null
+    /** 单个平台内部：两路取高者。 */
+    let sources
+    let version = null
+    if (ifaceVersion !== null && linkVersion !== null) {
+      sources = 'both'
+      version = compareVersions(ifaceVersion, linkVersion) >= 0 ? ifaceVersion : linkVersion
+      if (ifaceVersion !== linkVersion) {
+        log('warn', `${platformId} 的接口与文件名不一致（接口 ${ifaceVersion} / 文件名 ${linkVersion}），按高者取 ${version}`)
+      }
+    } else if (ifaceVersion !== null) {
+      sources = 'interface'
+      version = ifaceVersion
+    } else if (linkVersion !== null) {
+      sources = 'link'
+      version = linkVersion
+    } else {
+      sources = 'none'
+    }
+
+    platformResults.push({
+      platform: platformId,
+      role: probe.role,
+      interfaceVersion: ifaceVersion,
+      linkVersion,
+      linkFile: link.ok ? link.filename : null,
+      sources,
+      version,
+      error: iface.ok ? (link.ok ? null : (link.error ?? null)) : (iface.error ?? null),
+    })
   }
 
-  if (link.ok && link.platformOk === false) {
-    // 只提醒、不拦：文件名拼法偶尔会变，为这个停下判定不值得。
-    log('warn', `下载链接的平台串不是本机的（期望 ${link.expectedPlatform}）：${link.filename}`)
-  }
-  if (sources === 'interface') {
-    log('warn', `没拿到可解析的下载链接（${link.error ?? 'unknown'}），本轮只看接口版本`)
-  }
-  if (versionGap) {
-    log('warn', `接口与文件名版本不一致（接口 ${ifaceVersion} / 文件名 ${linkVersion}），按高者取 ${judgedVersion}`)
-  }
+  const judging = platformResults.filter((r) => r.role === 'judge' && r.version !== null)
+  const judgedVersion = judging.length === 0
+    ? null
+    : judging.map((r) => r.version).reduce((a, b) => (compareVersions(a, b) >= 0 ? a : b))
+  /** 谁把版本号抬到了判定值（多个平台同值时都算）。 */
+  const judgedFrom = judging.filter((r) => r.version === judgedVersion).map((r) => r.platform)
+  const sources = judging.length === 0
+    ? 'none'
+    : (judging.every((r) => r.sources === 'both') ? 'both' : 'interface')
+  const versionGap = judging
+    .filter((r) => r.interfaceVersion !== null && r.linkVersion !== null && r.interfaceVersion !== r.linkVersion)
+  const failed = judging.filter((r) => r.version === null)
+
+  log('info', `平台矩阵：${platformResults
+    .map((r) => `${r.platform.replace('workbuddy-', '')}=${r.version ?? `失败(${r.error})`}${r.role === 'record' ? '(记录)' : ''}`)
+    .join('，')} → 判定 ${judgedVersion ?? '不做'}`)
+  for (const r of failed) log('warn', `判定平台 ${r.platform} 取不到版本：${r.error}`)
 
   const config = effectiveConfig()
 
@@ -941,21 +1020,24 @@ async function main() {
    */
   const legacyBaseline = Boolean(state.baseline) && state.baseline?.source === undefined
   /**
-   * 平台变了 = 判定作用域变了，不是客户端更新。
+   * 判定名单变了 = 判定口径变了，不是客户端更新。
    *
-   * 触发场景：Node 从 x64 换成 arm64（Rosetta、换机器、升级 Node）、用户改了
-   * WORKBUDDY_WATCH_PLATFORM、或者代码里的推断规则变了。这时版本号会从
-   * 5.9.3.42398134 跳到 5.6.2.40046327（Linux 线），照旧比较就是一次假的
-   * 「客户端更新了」，会平白弹出停用提示。
+   * 触发场景：代码把某个平台加进/移出判定集（比如这次把 linux 摘出去、把
+   * mac+win 三条都算进来）、换了机器、或者 WORKBUDDY_WATCH_UPSTREAM 在单路
+   * 与多路之间切换。这些都会让「判定值」跳变，照旧比较就是一次假的
+   * 「客户端更新了」。
    *
-   * 所以：老基线记着别的平台 → 静默重锚，只在日志里说一句。
+   * 老基线里没有 `judgeSet`（上一个版本只有单平台）→ 同样按「口径变了」处理，
+   * 静默重锚一次。
    */
-  const platformChanged = Boolean(state.baseline?.platformId) && state.baseline.platformId !== PLATFORM_ID
-  if (platformChanged) {
-    log('warn', `判定平台变了（${state.baseline.platformId} → ${PLATFORM_ID}），版本号不可比，重新落基点`)
+  const previousJudgeSet = state.baseline?.judgeSet
+  const judgeSetChanged = Boolean(state.baseline)
+    && (previousJudgeSet === undefined || previousJudgeSet.join(',') !== PLATFORMS_JUDGE.join(','))
+  if (judgeSetChanged) {
+    log('warn', `判定平台集合变了（${previousJudgeSet === undefined ? '旧格式·单平台' : previousJudgeSet.join('+')} → ${PLATFORMS_JUDGE.join('+')}），重新落基点`)
   }
   /** 这两种情况都按「没有基线」处理：不报事件，直接落新基点。 */
-  const reanchor = legacyBaseline || platformChanged
+  const reanchor = legacyBaseline || judgeSetChanged
   if (legacyBaseline) {
     log('warn', `基线是旧格式（${state.baseline?.version ?? '?'}，来自本机指纹），按「无基线」重新落基点`)
   }
@@ -982,7 +1064,7 @@ async function main() {
     && state.baseline.version !== judgedVersion
   if (judgedVersion === null) {
     // 两路都拿不到版本就**什么都不做**：不推进基线、不报事件、不挂提示。
-    log('warn', `读取接口版本失败: ${upstream.error} —— 本轮不判定`)
+    log('warn', `所有判定平台都取不到版本（${judging.length === 0 ? '无可用平台' : ''}）—— 本轮不判定`)
   } else if (firstRun || reanchor) {
     log('info', `落基线：${sources === 'both' ? '接口与文件名一致' : '仅接口'} 版本 ${judgedVersion}（不报警）`)
   } else if (mismatch) {
@@ -993,13 +1075,13 @@ async function main() {
       from: recorded,
       to: judgedVersion,
       action: config.disableOnHit ? 'disable-bundle' : 'report-only',
-      url: link.ok ? link.url : (upstream.url ?? null),
-      interfaceVersion: ifaceVersion,
-      linkVersion,
+      url: `https://www.workbuddy.cn/v2/update?platform=${judgedFrom[0] ?? PLATFORM_ID}`,
+      judgedFrom,
+      platforms: platformResults.map((r) => ({ platform: r.platform, version: r.version })),
     })
     if (versionChanged) {
       log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → ${judgedVersion}`
-        + `（接口 ${ifaceVersion ?? '?'}，文件名 ${linkVersion ?? '?'}）`)
+        + `（来自 ${judgedFrom.join(' + ')}）`)
     }
   }
 
@@ -1089,7 +1171,7 @@ async function main() {
        * 默认路径：**只报警，不动手**。
        *
        * 检测到版本号对不上，把「该停用了」这件事写进水印，由用户在界面上选
-       * 「软结束」或「硬结束」。守卫不替用户决定什么时候掐断他的会话——
+       * 「软结束」或「硬结束」。呵护插件不替用户决定什么时候掐断他的会话——
        * 一个正在跑的任务被自动中止，比晚几秒停用糟糕得多。
        *
        * 水印上带 `pendingDisable` 与 `actions`，浏览器半据此画出三个按钮。
@@ -1129,11 +1211,15 @@ async function main() {
     if (judgedVersion !== null && !simulated && !MODE_CHECK) {
       state.baseline = {
         version: judgedVersion,
-        /** 这个数是在哪个平台上取的。跨平台比版本号没有意义。 */
+        /** 本机是哪个平台（只做记录，不再决定判定范围）。 */
         platformId: PLATFORM_ID,
-        /** 这个数是被几路确认过的：both / interface / link。 */
+        /** 参与判定的平台集合。这份名单变了就要重锚，否则会误判成「客户端更新」。 */
+        judgeSet: PLATFORMS_JUDGE,
+        /** 把版本抬到判定值的平台。 */
+        judgedFrom,
+        /** 这个数是被几路确认过的：both / interface。 */
         source: sources === 'both' ? 'interface+link' : sources,
-        linkFile: link.ok ? link.filename : null,
+        linkFile: judging.find((r) => r.linkFile !== null)?.linkFile ?? null,
         ...(state.baseline?.capturedAt ? { capturedAt: state.baseline.capturedAt } : {}),
         ...(state.baseline?.version === judgedVersion ? {} : { changedAt: nowIso() }),
         updatedAt: nowIso(),
@@ -1197,17 +1283,16 @@ async function main() {
       at: nowIso(),
       platformId: PLATFORM_ID,
       sources,
-      interfaceVersion: ifaceVersion,
-      linkVersion,
-      linkFile: link.ok ? link.filename : null,
-      /** 最终采信的版本（两路不一致时取高者）。 */
+      judgedFrom,
       judgedVersion,
       versionGap,
+      platforms: platformResults,
     }
-    state.lastUpstreamError = upstream.ok ? null : upstream.error
+    state.lastUpstreamError = judgedVersion === null ? (failed.map((r) => `${r.platform}:${r.error}`).join(';') || 'none') : null
+    state.platforms = platformResults
     state.lastPluginError = pluginLatest.ok || NO_UPGRADE ? null : pluginLatest.error
     writeJsonAtomic(STATE_FILE, state)
-    log('info', `检查 #${state.checks}：接口 ${ifaceVersion ?? `读取失败(${upstream.error})`}，文件名 ${linkVersion ?? `未解析(${link.error})`}，判定 ${judgedVersion ?? '不做'}${simulated ? '(模拟)' : ''}，基线 ${state.baseline?.version ?? '?'}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
+    log('info', `检查 #${state.checks}：判定 ${judgedVersion ?? '不做'}（来自 ${judgedFrom.join('+') || '无'}）${simulated ? '(模拟)' : ''}，基线 ${state.baseline?.version ?? '?'}，插件 ${installedVersion ?? '?'}${pluginLatest.ok ? `(latest ${pluginLatest.version})` : ''}，事件 ${events.length} 个`)
   }
 
   // 5) 通知（只在真的停用、待用户确认、或插件自升级时弹）
@@ -1226,7 +1311,7 @@ async function main() {
     checkedAt: nowIso(),
     firstRun,
     legacyBaseline,
-    platformChanged,
+    judgeSetChanged,
     platformId: PLATFORM_ID,
     baseline: state.baseline
       ? {
@@ -1236,18 +1321,9 @@ async function main() {
         updatedAt: state.baseline.updatedAt ?? null,
       }
       : null,
-    upstream: upstream.ok
-      ? {
-        version: upstream.version,
-        publishedAt: upstream.publishedAt ?? null,
-        url: upstream.url ?? null,
-        simulated,
-      }
-      : { error: upstream.error },
-    /** 从下载链接文件名里解析出来的那一路。 */
-    link: link.ok
-      ? { version: link.version, filename: link.filename, ext: link.ext, platformOk: link.platformOk }
-      : { error: link.error ?? null },
+    /** 每个平台的原始观测（含只记录的 linux）。 */
+    platforms: platformResults,
+    judgedFrom,
     sources,
     judgedVersion,
     /** 两路不一致时：谁低、谁被采信。一致时为 null。 */

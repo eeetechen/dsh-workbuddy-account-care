@@ -50,7 +50,7 @@ window.__ModuleLoader__.load({
     const RESHOW_MS = 1800
     /** 用户在这里选「软结束 / 硬结束」时打到 Host 的端点。 */
     const ACTION_URL = '/plugins/dsh-workbuddy-account-care/action'
-    /** 被守卫的 provider 前缀，与 index.js 的 GUARDED_PROVIDERS 保持一致。 */
+    /** 被呵护插件的 provider 前缀，与 index.js 的 GUARDED_PROVIDERS 保持一致。 */
     const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
 
     /**
@@ -276,7 +276,7 @@ window.__ModuleLoader__.load({
      * 那么只要曾经用过一次 WorkBuddy，水印就会永远亮着——那正是要修掉的问题。
      */
     function useWorkbuddyUsage(sessions) {
-      // 拿不到会话服务 → 不知道谁在用，退回「保守显示」，别让守卫静默失效
+      // 拿不到会话服务 → 不知道谁在用，退回「保守显示」，别让呵护插件静默失效
       const [usage, setUsage] = React.useState(
         sessions === undefined || sessions === null ? { running: true, selected: true } : { running: false, selected: false },
       )

@@ -1,6 +1,6 @@
 {
   "name": "dsh-workbuddy-account-care",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "dsh-workbuddy 账号呵护：dsh-connect-workbuddy 的配套辅助插件。按 WorkBuddy 官方接口字段与安装包文件名解析出的版本号（取高者）与本地基线比对，不一致就提示并停用 dsh-connect-workbuddy、软结束正在用它的会话，并在界面顶部挂持久水印；同时自动升级 dsh-connect-workbuddy 自身。",
   "keywords": [
@@ -33,9 +33,20 @@
     "LICENSE",
     "docs/*.png"
   ],
+  "scripts": {
+    "test": "node test/uses-workbuddy.test.mjs"
+  },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/eeetechen/dsh-workbuddy-account-care.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eeetechen/dsh-workbuddy-account-care/issues"
+  },
+  "homepage": "https://github.com/eeetechen/dsh-workbuddy-account-care#readme",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -47,13 +58,5 @@
         "@deepseek-ai/dsh-client-ui-slots"
       ]
     }
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+ssh://git@github.com/eeetechen/dsh-workbuddy-account-care.git"
-  },
-  "bugs": {
-    "url": "https://github.com/eeetechen/dsh-workbuddy-account-care/issues"
-  },
-  "homepage": "https://github.com/eeetechen/dsh-workbuddy-account-care#readme"
+  }
 }

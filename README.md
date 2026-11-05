@@ -15,7 +15,7 @@
 
 ## ⚠️ 前置条件：先装 `dsh-connect-workbuddy`
 
-**本插件是 `dsh-connect-workbuddy` 的守卫，不是它的替代品，也不能单独工作。**
+**本插件是 `dsh-connect-workbuddy` 的呵护插件，不是它的替代品，也不能单独工作。**
 它没有自己的模型、没有自己的 provider、没有自己的界面入口；它的全部动作都围绕
 「那个插件现在安不安全」展开。所以你**必须先装好 `dsh-connect-workbuddy`，再来装本插件**。
 
@@ -28,22 +28,22 @@
 dsh plugin --profile web add dsh-connect-workbuddy
 
 # 2) 确认它已被选中、且模型选择器里能看到 WorkBuddy 的模型
-#    然后才装本守卫
+#    然后才装本呵护插件
 dsh plugin --profile web add dsh-workbuddy-account-care
 ```
 
-**没装就完全不动。** 守卫每次检查前先确认 `dsh-connect-workbuddy` 真的在
+**没装就完全不动。** 呵护插件每次检查前先确认 `dsh-connect-workbuddy` 真的在
 `node_modules` 里；不在就整轮跳过——不停用、不升级、不挂水印、不碰 profile，
 连基线都不写（只留一行日志说明为什么跳过）。
 
-这条不是礼貌，是必需的：本守卫的一项动作是「自动升级
+这条不是礼貌，是必需的：本呵护插件的一项动作是「自动升级
 `dsh-connect-workbuddy`」。在没有装它的机器上，那个动作会变成**凭空安装一个
 你没要求过的插件**。所以未安装时它必须彻底安静。
 
 ## 它解决什么
 
 `dsh-connect-workbuddy` 靠 **WorkBuddy 客户端的私有接口**工作（伪装客户端、
-复用本机登录态），客户端一更新，那些接口随时可能变。这个守卫把风险面收窄成两条规则：
+复用本机登录态），客户端一更新，那些接口随时可能变。这个呵护插件把风险面收窄成两条规则：
 
 | 事件 | 动作 |
 |---|---|
@@ -57,7 +57,7 @@ dsh plugin --profile web add dsh-workbuddy-account-care
 
 ## 判定数据源
 
-整个守卫只读**一个**外部数据源：
+整个呵护插件只读**一个**外部数据源：
 
 ```
 GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
@@ -73,15 +73,27 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 }
 ```
 
-从这条响应里取**两个**版本号：
+每轮探 **5 个平台**，只有 3 个参与判定：
+
+| 角色 | platform | 参与判定 |
+|---|---|---|
+| 判定 | `workbuddy-darwin-x64` / `-arm64` / `workbuddy-win32-x64-user` | ✅ 三者取高者 |
+| 记录 | `workbuddy-linux-x64-deb` / `-arm64-deb` | ❌ 只写日志与 `--status` |
+
+**为什么把 Linux 摘出去**：实测它整线滞后一个大版本段（`5.6.2` vs `5.9.3`），
+算进「取高者」只会制造噪声。等官方三端对齐了，把它加回
+`PLATFORMS_JUDGE` 即可，代码里就一个数组。
+
+每个平台从响应里取**两个**版本号：
 
 | # | 来源 | 例子 |
 |---|---|---|
 | 1 | `productVersion`（没有时退回 `version`） | `5.9.3.42398134` |
 | 2 | `url` 的**文件名**里的版本号 | `WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.dmg` → `5.9.3.42398134` |
 
-两者取**高的那个**，再与 `state.json` 的 `baseline.version` 做**字符串比较**：
-不等就报一次「版本不一致」。
+单个平台内部，两者取高；三个判定平台之间，再取高者，得到**判定版本**。
+最后与 `state.json` 的 `baseline.version` 做**字符串比较**：不等就报一次
+「版本不一致」。
 
 链接按平台给，脚本只按本机平台去解析文件名，格式是稳定的一段：
 
@@ -94,7 +106,7 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 所以**扩展名不参与判定**，版本号才参与。同一版本号有 4 段数字，最后一段是构建号；
 构建哈希（`d4692421`）是十六进制、不含点，不会被误认成版本。
 
-> **只解析，不下载。** 这个守卫每 3 分钟跑一次，为了一句「没看错」去拖 180MB
+> **只解析，不下载。** 这个呵护插件每 3 分钟跑一次，为了一句「没看错」去拖 180MB
 > 的安装包显然不合理。解析是纯字符串操作：拆 URL、取最后一段、跑一条正则。
 > 它也不会对链接发 HEAD 或任何请求。
 
@@ -108,15 +120,13 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 平台标识取自官网下载页自己的那份清单，一共 7 个可用（`workbuddy-latest` 会
 400，`workbuddy-darwin-universal` 也能用但不属于任何一台具体机器）：
 
-| platform | 接口 `productVersion` | 安装包文件名 | 包类型 | 发布时间 |
+| platform | 角色 | 接口 `productVersion` | 安装包文件名 | 发布 |
 |---|---|---|---|---|
-| `workbuddy-darwin-x64` | `5.9.3.42398134` | `WorkBuddy-darwin-x64-5.9.3.42398134-d4692421.zip` | zip | 2026-10-28 01:15 |
-| `workbuddy-darwin-arm64` | `5.9.3.42398134` | `WorkBuddy-darwin-arm64-5.9.3.42398134-d4692421.zip` | zip | 2026-10-28 01:15 |
-| `workbuddy-win32-x64-user` | `5.9.3.42398134` | `WorkBuddy-win32-x64-user-5.9.3.42398134-d4692421.exe` | exe | 2026-10-28 01:15 |
-| `workbuddy-linux-x64-deb` | **`5.6.2.40046327`** | `WorkBuddy-linux-x64-deb-5.6.2.40046327-c7b525f3.deb` | deb | 2026-09-30 19:58 |
-| `workbuddy-linux-x64-rpm` | **`5.6.2.40046327`** | `WorkBuddy-linux-x64-rpm-5.6.2.40046327-c7b525f3.rpm` | rpm | 2026-09-30 19:58 |
-| `workbuddy-linux-arm64-deb` | **`5.6.2.40046327`** | `WorkBuddy-linux-arm64-deb-5.6.2.40046327-c7b525f3.deb` | deb | 2026-09-30 19:58 |
-| `workbuddy-linux-arm64-rpm` | **`5.6.2.40046327`** | `WorkBuddy-linux-arm64-rpm-5.6.2.40046327-c7b525f3.rpm` | rpm | 2026-09-30 19:58 |
+| `workbuddy-darwin-x64` | 判定 | `5.9.3.42398134` | `…darwin-x64-5.9.3.42398134-d4692421.zip` | 10-28 |
+| `workbuddy-darwin-arm64` | 判定 | `5.9.3.42398134` | `…darwin-arm64-5.9.3.42398134-d4692421.zip` | 10-28 |
+| `workbuddy-win32-x64-user` | 判定 | `5.9.3.42398134` | `…win32-x64-user-5.9.3.42398134-d4692421.exe` | 10-28 |
+| `workbuddy-linux-x64-deb` | 记录 | **`5.6.2.40046327`** | `…linux-x64-deb-5.6.2.40046327-c7b525f3.deb` | 09-30 |
+| `workbuddy-linux-arm64-deb` | 记录 | **`5.6.2.40046327`** | `…linux-arm64-deb-5.6.2.40046327-c7b525f3.deb` | 09-30 |
 
 两点结论：
 
@@ -125,18 +135,24 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 2. **平台之间差一个大版本段**：macOS / Windows 在 `5.9.3`，Linux 全线还在
    `5.6.2`。
 
-第 2 条不是瑕疵，但它决定了「版本号」必须**限定在同一个 platform 内**才有意义。
-所以 `baseline` 会连带记下 `platformId`：
+第 2 条正是把 Linux 排除在判定之外的理由——但判定范围一变，判定值也会跟着跳。
+所以 `baseline` 会记下**当时用的判定平台集合**：
 
 ```json
-{ "version": "5.9.3.42398134", "platformId": "workbuddy-darwin-x64", "source": "interface+link" }
+{
+  "version": "5.9.3.42398134",
+  "judgeSet": ["workbuddy-darwin-x64", "workbuddy-darwin-arm64", "workbuddy-win32-x64-user"],
+  "judgedFrom": ["workbuddy-darwin-x64", "workbuddy-darwin-arm64", "workbuddy-win32-x64-user"],
+  "platformId": "workbuddy-darwin-x64"
+}
 ```
 
-**换平台 = 重新落基点，不报更新。** 触发场景：Node 从 x64 换到 arm64（Rosetta、
-换机器、升级 Node）、手改 `WORKBUDDY_WATCH_PLATFORM`、或者推断规则本身变了。
-这时版本会从 `5.9.3.42398134` 跳到 `5.6.2.40046327`，照旧比较就是一次假的
-「客户端更新了」，会平白弹出停用提示。脚本发现 `baseline.platformId` 与当前
-平台不一致时，只写一条日志并静默重锚。
+**判定集合变了 = 重新落基点，不报更新。** 触发场景：代码里改了 `PLATFORMS_JUDGE`、
+`WORKBUDDY_WATCH_UPSTREAM` 在单路与多路之间切换、或者基线还是旧格式（只有单平台）。
+这时判定值会跳变，照旧比较就是一次假的「客户端更新了」。脚本发现集合不一致时
+只写一条日志并静默重锚。
+
+`platformId` 仍然记，但**不再决定判定范围**——它只用来在日志里说明「这台机器是哪一端」。
 
 **刻意不读本机安装。** 早先的版本靠在客户端的安装目录里翻 `app.asar` 的
 `package.json`、内置插件的 build id、`cli/product.json` 的 commit，拼成一个指纹。
@@ -179,12 +195,12 @@ dsh plugin --profile web add dsh-workbuddy-account-care
 装完之后可以这样确认它在工作：
 
 ```bash
-npx dsh-workbuddy-account-care status    # 守卫状态：目标插件版本 / 启用与否 / 水印 / 检查次数
+npx dsh-workbuddy-account-care status    # 呵护插件状态：目标插件版本 / 启用与否 / 水印 / 检查次数
 npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 ```
 
 `status` 里 `plugin on` 指的是 **`dsh-connect-workbuddy`** 是否仍被选中——
-本守卫自己始终是启用的，它不守卫自己。
+本呵护插件自己始终是启用的，它不呵护插件自己。
 
 > DSH 的「自动化任务」是**按计划给会话发一条消息**——每触发一次就是一次完整
 > 的模型回合。3 分钟一次等于一天 480 个回合，去换 480 句「无变化」。这件事
@@ -209,7 +225,7 @@ npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 
 ### 检测到更新：先问你，再动手
 
-**默认不再自动停用。** 检测到接口版本与基线不一致之后，守卫会：
+**默认不再自动停用。** 检测到接口版本与基线不一致之后，呵护插件会：
 
 1. 先看**有没有正在运行的 workbuddy 会话**——没有就不打扰；有才在界面顶部挂提示；
 2. 等你在提示上选一个结束方式。
@@ -295,10 +311,9 @@ npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 dsh-workbuddy-account-care（Host 半）
   ├─ 每 3 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
-  │     ├─ 读 WorkBuddy 官方接口 /v2/update，取出两路版本号
-  │     │   ├─ productVersion
-  │     │   ├─ url 文件名里的版本号（只解析，不下载）
-  │     │   └─ 取高者 = 判定版本
+  │     ├─ 探 5 个平台（mac×2 + win 判定，linux×2 只记录）
+  │     │   ├─ 每个平台：productVersion ↔ url 文件名版本，取高
+  │     │   └─ 三个判定平台之间再取高 = 判定版本
   │     ├─ 读 npm 上 dsh-connect-workbuddy 的 latest
   │     ├─ 判定版本 ≠ 基线 → 写 guard.json（水印，等你选软结束/硬结束）
   │     │                    基线随即推进，同一版本不会反复弹
@@ -325,9 +340,17 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 
 ## 软结束会话
 
-只针对**正在跑**（`status === 'running'`）且**确实在用 WorkBuddy**（投影
-`modelSelection`、`agent.options`、日志里最后一条 assistant 消息，三路任一命中）
-的会话：
+只针对**正在跑**（`status === 'running'`）且**确实在用 WorkBuddy**的会话，
+「在用」只认**会话投影 `modelSelection`**——它和界面上的模型选择器读的是同一份
+数据（`next = pending ?? lastUsed`），所以不会出现「界面没提示、会话却被停用」。
+
+> 以前还把 `agent.options.provider` 当独立证据，那是会话**创建时**的配置，中途
+> 换 provider 不会更新。结果一条一直在用 deepseek 的会话（只是在对话里聊到
+> WorkBuddy）被软结束了。现在它只在投影服务整个不可用时才参与，而且要与最后
+> 一条 assistant 消息的 provider 同时命中才算。`test/uses-workbuddy.test.mjs`
+> 锁住了这个行为。
+
+具体动作：
 
 1. `agent.cancel({ kind: 'hook' }, { keepInbox: true })` —— 中止当前轮，保留收件箱；
 2. `agent.followup(...)` —— 排一条「本机 provider 已更新，本条消息由监控插件自动发送，收到后暂停你的所有任务, 等待重启 agent 工具」
@@ -339,7 +362,7 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 ## 命令
 
 ```bash
-npx dsh-workbuddy-account-care status    # 守卫状态：版本、启用与否、水印、检查次数
+npx dsh-workbuddy-account-care status    # 呵护插件状态：版本、启用与否、水印、检查次数
 npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 npx dsh-workbuddy-account-care check     # 立刻跑一次检查
 ```
@@ -417,9 +440,11 @@ node node_modules/dsh-workbuddy-account-care/scripts/watch.mjs
   同样可能打破插件假设，所以不分方向。
 - **接口读不到就不判定**。断网 / 接口 404 / 超时那一轮什么都不做：不报警、
   不推进基线、不改配置。宁可晚一轮，也不拿「读不到」当「变了」。
-- **平台是判定作用域的一部分**。各平台不同步发版（Linux 比 macOS/Windows 落后
-  一个大版本段），所以 `baseline` 记着 `platformId`；平台一变就静默重锚，
-  不把它当成「客户端更新」。
+- **只有 mac + win 参与判定**。Linux 整线滞后一个大版本段，目前只记录不判定；
+  这意味着**在 Linux 上不会因为 Linux 客户端更新而报警**。要改就动
+  `PLATFORMS_JUDGE` 一个数组，改完会自动静默重锚一次。
+- **每轮打 5 个请求**（3 个判定 + 2 个记录）。设了 `WORKBUDDY_WATCH_UPSTREAM`
+  就退化成 1 个（那个地址通常已绑定平台）。
 - **基线即上次接口值**。所以在同一版本上只弹一次；想重新落基点，删掉
   `state.json` 里的 `baseline`（下一轮静默重建，不报警）。`--check` 也**不**推进
   基线——它只是「看一眼」，跑一次不该把这次变化消费掉。

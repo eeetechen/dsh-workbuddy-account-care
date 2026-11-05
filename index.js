@@ -63,7 +63,7 @@ import { fileURLToPath } from 'node:url'
 /** 本进程的启动时刻：早于它的「一次性」水印都算过期。 */
 const BOOT_AT_MS = Date.now()
 
-/** 被守卫的 bundle 名。 */
+/** 被呵护插件的 bundle 名。 */
 const GUARDED_BUNDLE = 'dsh-connect-workbuddy'
 /** 会被当成「正在用 WorkBuddy」的 provider 前缀。 */
 const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
@@ -215,32 +215,51 @@ const DEFAULT_STOP_TEXT = '本机 provider 已更新，本条消息由监控插�
 const SOFT_STOP_MARKER = '本条消息由监控插件自动发送'
 
 /**
- * 这条会话是不是「正在用 WorkBuddy」。
- *
- * 两个证据来源，任一命中即算：
- *   - 会话投影 `modelSelection.next` / `lastUsed` 的 provider 是 workbuddy 系
- *   - 最近一条 assistant 消息的 source.provider 是 workbuddy 系（覆盖「正在跑但
- *     还没落定选择」的情况，也覆盖投影单元未注册时的降级）
+ * 日志里最后一条 assistant 消息是谁生成的（只用于降级判定，见下）。
  */
-function usesWorkbuddy(agent, projections) {
-  const selection = projections?.modelSelection
-  for (const candidate of [selection?.next, selection?.lastUsed]) {
-    if (candidate && GUARDED_PROVIDERS.includes(candidate.provider)) return `${candidate.provider}/${candidate.model}`
-  }
-  const options = agent?.options ?? {}
-  if (GUARDED_PROVIDERS.includes(options.provider)) return `${options.provider}/${options.model}`
-  // 兜底：从日志里最后一条 assistant 消息反推
+function lastAssistantProvider(agent) {
   try {
     const events = agent.session.ownEvents()
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const event = events[i]
       if (event.type !== 'assistant/message') continue
       const source = event.data?.message?.source
-      if (source && GUARDED_PROVIDERS.includes(source.provider)) return `${source.provider}/${source.model}`
-      break
+      return source?.provider ?? null
     }
-  } catch { /* 读不到日志就不算 */ }
+  } catch { /* 读不到日志就当不知道 */ }
   return null
+}
+
+/**
+ * 这条会话是不是「正在用 WorkBuddy」。
+ *
+ * **唯一可信的证据是会话投影 `modelSelection`**。它和界面上那个模型选择器
+ * 读的是同一份数据（`next = pending ?? lastUsed`），所以「界面没提示、会话
+ * 却被停用」这种事不会发生——两边永远一致。
+ *
+ * 踩过的坑（2026-11-05）：曾经把 `agent.options.provider` 也当成独立证据。
+ * 那是会话**创建时**的配置，用户中途换过 provider 并不会更新。于是一条一直
+ * 在用 deepseek 的会话（只是聊到了 WorkBuddy）被判成 workbuddy，收到了软
+ * 结束指令。所以现在它不再有独立否决权。
+ *
+ * 只有在投影服务整个不可用时才降级，而且要求两个信号同时成立（配置 +
+ * 最后一条 assistant 消息都是 workbuddy）——拿不准就不动手，比误伤便宜。
+ */
+function usesWorkbuddy(agent, projections) {
+  const selection = projections?.modelSelection
+  // `next` 就是界面选择器显示的那个值（= pending ?? lastUsed），优先信它；
+  // 只有它缺席时才回退到 lastUsed。
+  const current = selection?.next ?? selection?.lastUsed
+  if (current && GUARDED_PROVIDERS.includes(current.provider)) return `${current.provider}/${current.model}`
+  // 投影可用且明确说了别的 provider → 到此为止，不再找别的证据
+  if (selection !== undefined && selection !== null) return null
+
+  // ---- 降级路径：投影不可用 ----
+  const options = agent?.options ?? {}
+  if (!GUARDED_PROVIDERS.includes(options.provider)) return null
+  const lastProvider = lastAssistantProvider(agent)
+  if (lastProvider === null || !GUARDED_PROVIDERS.includes(lastProvider)) return null
+  return `${options.provider}/${options.model ?? '?'}`
 }
 
 /**
@@ -630,12 +649,12 @@ export function apply(ctx, config = {}) {
     : DEFAULT_INTERVAL_MINUTES
 
   /**
-   * 被守卫的插件是否装在本机。
+   * 被呵护插件的插件是否装在本机。
    *
    * 没装就**不派生进程**：脚本自己也会判一次，但这里先挡一道，省掉每 3 分钟
    * 一个必然空转的子进程，也避免在没有那个插件的环境里留下任何状态文件。
    *
-   * `installed` 是「profile 声明了这个依赖」，与「是否被选中」无关 —— 守卫
+   * `installed` 是「profile 声明了这个依赖」，与「是否被选中」无关 —— 呵护插件
    * 自己会把它从 bundles 里摘掉，那时它仍然是已安装、只是停用。
    */
   async function guardTargetInstalled() {
@@ -661,7 +680,7 @@ export function apply(ctx, config = {}) {
           const installed = await guardTargetInstalled()
           if (installed === false) {
             if (!loggedMissing) {
-              logger.warn?.(`[workbuddy-guard] ${GUARDED_BUNDLE} 未安装，守卫保持静默（装上后自动开始）`)
+              logger.warn?.(`[workbuddy-guard] ${GUARDED_BUNDLE} 未安装，呵护插件保持静默（装上后自动开始）`)
               loggedMissing = true
             }
           } else {
@@ -716,3 +735,6 @@ export const DEFAULT_WATERMARK = {
   title: 'WB 更新了',
   body: '还用，你的账号是批发的吗？',
 }
+
+/** 测试出口：不参与插件契约，只有 test/ 里的用例 import 它。 */
+export { usesWorkbuddy }
