@@ -355,18 +355,37 @@ window.__ModuleLoader__.load({
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
       const usage = useWorkbuddyUsage(sessions)
+      /** 被呵护 bundle 的开关状态；null = 读不到。 */
+      const bundleEnabled = state?.bundleEnabled ?? null
+      /** 插件是不是已经关了。下面门控与「知道了」的语义都要用。 */
+      const bundleClosed = bundleEnabled === false
+      /** 有后台 wb 会话在跑（不含当前正在看的那个）。 */
+      const hasBackground = usage.running === true
+      /** 这条是「等你决定」的提示（带软结束/硬结束/关闭插件）。 */
+      const isPending = watermark?.pendingDisable === true
+      /** 升级通知（带 dismissible / untilRestart）：与 provider、bundle 都无关。 */
+      const isUpgradeCard = watermark?.dismissible === true || watermark?.untilRestart === true
       /**
-       * 显示门控（需求 3）：**只要还在用 workbuddy 就显示**，
-       * 三条来源任一命中：
+       * 显示门控（需求 3，按阶段区分）：
        *
-       *   1. 当前正在看的会话选中了 wb provider（切换那一刻就算，不用发消息）
-       *   2. 任何后台会话正在跑 wb provider（切到别的界面也照样显示）
-       *   3. 已停用后用户强开了插件，且当前会话是 wb（同样被 1 覆盖）
+       *   **待确认**（`pendingDisable`，插件还开着，等你选软结束/硬结束/关闭插件）
+       *     → **无条件显示**。需求原文：「没后台任务时，弹出水印，两个按钮」——
+       *       这一刻的告警与「当前用没用 wb」无关，它是提醒你「该关插件了」。
+       *       之前写成跟 provider 走，于是模型一换成别的 provider 水印就没了，
+       *       用户根本看不到该处理的那条提示。
        *
-       * 三个都不成立 → 不显示。这正是需求第 25 行要的
-       * 「所有 wb 后台结束、且当前会话不是 wb → 自然消失」。
+       *   **已处理**（插件已关，或你后来强开了它）
+       *     → 跟随 provider：还在用 wb 就显示，切走且后台也停了就自然消失
+       *       （需求第 25 行）。插件关着的时候本来就没有 provider 可用，
+       *       这条水印也就没有意义——「关闭插件后水印消失」。
+       *
+       *   升级通知 → 永远显示（它说的是「我改过你的环境」，与用哪个 provider 无关）。
        */
-      const gateOpen = usage.running || usage.selected
+      const gateOpen = isUpgradeCard
+        ? true
+        : bundleClosed
+          ? false
+          : (isPending ? true : (usage.running || usage.selected))
 
       /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
       const [snoozedRevision, setSnoozedRevision] = React.useState(null)
@@ -441,16 +460,37 @@ window.__ModuleLoader__.load({
       const onDismiss = () => {
         setLeaving(true)
         leaveTimer.current = setTimeout(() => {
-          setSnoozedRevision(revision)
           setLeaving(false)
           /**
-           * `dismissible: true` 的水印点了之后**永久收起**，不再复活。
+           * 「知道了」有**两种**语义，按当前形态决定（需求 3）：
            *
-           * 这类水印提示的是一件**已经完成**的事（例如「插件已升级，已热生效」），
-           * 没有未了的风险，反复弹只会让人烦。而 WB 版本来不及适配那种红牌
-           * 不带这个字段——它必须一直提醒到用户真的处理为止。
+           *   永久收起 —— 这条提示的使命已经完成，再弹只会烦人：
+           *     · 升级通知（`dismissible`）
+           *     · 待确认、但没有后台 wb 会话（两按钮「关闭插件 / 知道了」）：
+           *       需求第 19 行「点了之后消失」——没有任何正在跑的东西要提醒，
+           *       用户看过就够了
+           *
+           *   消失再重现 —— 强提醒，风险还在：
+           *     · 待确认、且有后台 wb 会话（三按钮，需求第 15 行）
+           *     · 已关闭后又被强行打开、正在用 wb（需求第 28 行
+           *       「点了之后消失，再重现。切换到非 wb provider 后水印消失」）
+           *
+           * 插件已经关闭的情况**不在这里处理**：那种状态下门控直接不放行
+           * （需求第 18 行「关闭插件…水印消失」），卡片压根不渲染，
+           * 也就不需要「点掉」这个动作。
+           *
+           * 之前一律用「收起 1.8 秒再浮出」，于是插件关掉后那条收尾水印
+           * 怎么点都回来，看起来像点不掉。
            */
-          if (watermark?.dismissible === true) return
+          const permanent = watermark?.dismissible === true
+            || (isPending && !hasBackground)
+          if (permanent) {
+            // 绑在 revision 上：将来 revision 一变（新一次告警）自然复位
+            setFinishedRevision(revision)
+            setSnoozedRevision(revision)
+            return
+          }
+          setSnoozedRevision(revision)
           // 只有「还在用 WorkBuddy」才重新浮出来；没在用就安静地收着
           reshowTimer.current = setTimeout(() => {
             if (!gateRef.current) return
@@ -523,21 +563,15 @@ window.__ModuleLoader__.load({
        * 「关闭插件」是个空动作——用户点了什么也不会发生，只会困惑。
        * 所以先看 `bundleEnabled`：false 就只剩「知道了」。
        */
-      const isPending = watermark.pendingDisable === true
-      const hasBackground = usage.running === true
-      /** 被呵护插件的开关状态；null=读不到（此时保持原行为，不因读不到就藏按钮）。 */
-      const bundleEnabled = state?.bundleEnabled ?? null
-      const bundleClosed = bundleEnabled === false
       const autoActions = bundleClosed
         ? ['ack']
         : ((watermark.handledBy !== undefined || !isPending)
             ? ['close', 'ack']
             : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
       /**
-       * 升级类水印（带 `dismissible` 或 `untilRestart`）保留宿主给的 actions：
-       * 它们只有「知道了」一个按钮，与有没有会话无关。
+       * 升级类水印保留宿主给的 actions（只有「知道了」），与有没有会话无关。
+       * `isUpgradeCard` 已在门控那段声明过，这里直接复用。
        */
-      const isUpgradeCard = watermark.dismissible === true || watermark.untilRestart === true
       const effectiveActions = isUpgradeCard ? actions : autoActions
       /**
        * 按钮表由**宿主**决定（`actions` 字段），客户端只负责画。
