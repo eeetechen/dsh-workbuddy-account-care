@@ -516,15 +516,23 @@ window.__ModuleLoader__.load({
        * 规则（需求 3）：
        *   有后台 wb 会话在跑        → soft / hard / ack
        *   没有后台任务（仅前台选中） → close / ack
+       *   **插件已经关了**          → 只有 ack
        *
-       * 已处理过的水印（`handledBy` 存在）永远用 close/ack 那一套：
-       * 它只在用户强开插件后才出现，此时该做的事就是再关掉。
+       * 已处理过的水印（`handledBy` 存在）本来用 close/ack：它只在用户强开
+       * 插件后才出现，此时该做的事就是再关掉。但如果插件当前就是关着的，
+       * 「关闭插件」是个空动作——用户点了什么也不会发生，只会困惑。
+       * 所以先看 `bundleEnabled`：false 就只剩「知道了」。
        */
       const isPending = watermark.pendingDisable === true
       const hasBackground = usage.running === true
-      const autoActions = watermark.handledBy !== undefined || !isPending
-        ? ['close', 'ack']
-        : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack'])
+      /** 被呵护插件的开关状态；null=读不到（此时保持原行为，不因读不到就藏按钮）。 */
+      const bundleEnabled = state?.bundleEnabled ?? null
+      const bundleClosed = bundleEnabled === false
+      const autoActions = bundleClosed
+        ? ['ack']
+        : ((watermark.handledBy !== undefined || !isPending)
+            ? ['close', 'ack']
+            : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
       /**
        * 升级类水印（带 `dismissible` 或 `untilRestart`）保留宿主给的 actions：
        * 它们只有「知道了」一个按钮，与有没有会话无关。

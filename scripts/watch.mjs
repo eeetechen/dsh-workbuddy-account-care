@@ -1276,38 +1276,36 @@ async function main() {
   const wbMismatch = judgedVersion !== null && !firstRun && !reanchor
     && recordedWb !== judgedVersion
   /**
-   * connect 是否「没跟上」。
+   * connect 是否「跟上了」——判据只有一个：**它动过**。
    *
-   * 三种情形算跟上（= 不报警）：
-   *   · 现在装的版本与基线记的不同（升级发生过）
-   *   · 现在装的就是 npm 最新（没有更新的可装）
+   *   connectMoved = 现在装的版本 ≠ 基线里记的那一版
    *
-   * 什么都不算的情形：
-   *   · 读不到 connect 版本（信息不足，不猜）
+   * 为什么**不**把「已是最新」也算作跟上（曾经的错误实现）：
    *
-   * **老状态文件没有 `connectVersion`（本字段后加）→ 不参与「跟上」判断。**
-   * 那一轮只能比 WB 版本，等于退回旧行为（WB 一变就报警）。
+   *   用户装了 connect 5.20.2（= npm latest），基线也记 5.20.2。此时 WB 发了
+   *   新版，作者还没出适配版——connect 仍然是 latest，因为**根本没有更新的
+   *   可装**。把「latest」当豁免，等于说「没得升所以安全」，而这恰恰是唯一
+   *   真正危险、唯一该报警的场景。实测就是这样：WB 版本模拟更新后
+   *   `mismatch: false`、零事件，红牌根本弹不出来。
    *
-   * 这里刻意**不**把「已是最新」当成老基线的豁免理由：迁移那一刻用户可能
-   * 正处在「新 WB + 旧 connect」里，而那个 connect 恰好也是 latest（上游还没
-   * 发新版）——放行就等于漏掉唯一真正该报的场景。宁可多报一次，让用户在
-   * 界面上看到并决定。
+   * 正确语义与用户原话一致：「如果 dsh-workbuddy-connect 更新了，说明他
+   * 经过测试了」——关键是**更新发生过**，不是「当前是最新」。
+   *
+   * **老状态文件没有 `connectVersion`（本字段后加）→ 不参与判断。**
+   * 那一轮只能比 WB 版本，等于退回旧行为（WB 一变就报警），宁可多报一次。
    */
   const connectUnknownBaseline = recordedConnect === null || recordedConnect === undefined
   const connectMoved = !connectUnknownBaseline && connectInstalledVersion !== null
     && recordedConnect !== connectInstalledVersion
-  const connectIsLatest = connectLatest.ok && connectInstalledVersion !== null
-    && compareVersions(connectLatest.version, connectInstalledVersion) <= 0
-  const connectCaughtUp = !connectUnknownBaseline && (connectMoved || connectIsLatest)
+  const connectCaughtUp = connectMoved
   if (connectUnknownBaseline && wbMismatch) {
     log('warn', '基线里没有 connect 版本（旧格式），本轮按「只比 WB 版本」处理')
   }
   /** 真正的风险窗口：WB 变了，而 connect 还是基线里那个。 */
   const mismatch = wbMismatch && !connectCaughtUp
   if (wbMismatch && connectCaughtUp) {
-    log('info', `WB 版本变了（${recordedWb} → ${judgedVersion}），但 ${BUNDLE} 已跟上`
-      + `（基线 ${recordedConnect ?? '?'} → 现装 ${connectInstalledVersion ?? '?'}`
-      + `${connectIsLatest ? '，且已是最新' : ''}）—— 不报警`)
+    log('info', `WB 版本变了（${recordedWb} → ${judgedVersion}），但 ${BUNDLE} 也动过`
+      + `（基线 ${recordedConnect ?? '?'} → 现装 ${connectInstalledVersion ?? '?'}）—— 视为作者已适配，不报警`)
   }
   if (judgedVersion === null) {
     // 两路都拿不到版本就**什么都不做**：不推进基线、不报事件、不挂提示。

@@ -558,7 +558,7 @@ export function apply(ctx, config = {}) {
   /** 已经下发的水印 revision，避免每 15 秒重推同样的值。 */
   let publishedWatermarkRevision = -1
   /** 浏览器半要读的当前值。 */
-  let current = { watermark: null, revision: 0, guardFile: guardFile() }
+  let current = { watermark: null, revision: 0, guardFile: guardFile(), bundleEnabled: null }
 
   // ---- 浏览器半读这里 -------------------------------------------------
   ctx.effect(() => ctx.webServer.register({
@@ -572,6 +572,14 @@ export function apply(ctx, config = {}) {
       })
       res.end(JSON.stringify({
         watermark: current.watermark,
+        /**
+         * 被呵护的 bundle 现在开着吗（true / false / null=读不到）。
+         *
+         * 客户端据此决定要不要显示「关闭插件」按钮：插件已经关了，那个按钮
+         * 就是个空动作。放在顶层而不是 watermark 里，是因为它描述的是
+         * profile 状态，不是这条提示的内容。
+         */
+        bundleEnabled: current.bundleEnabled ?? null,
         revision: current.revision,
         at: new Date().toISOString(),
       }))
@@ -668,7 +676,13 @@ export function apply(ctx, config = {}) {
     await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
     await rename(tmp, file)
     publishedWatermarkRevision = snapshot.revision
-    current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
+    current = {
+      watermark: snapshot.watermark,
+      revision: snapshot.revision,
+      guardFile: file,
+      // 刚停用过 bundle，下一次 poll 会强制刷新；这里先带上前值
+      bundleEnabled: current.bundleEnabled ?? null,
+    }
     return snapshot.revision
   }
 
@@ -810,6 +824,22 @@ export function apply(ctx, config = {}) {
       const row = bundles.find((b) => b.name === GUARDED_BUNDLE)
       return row === undefined ? null : Boolean(row.enabled)
     } catch { return null }
+  }
+
+  /**
+   * 带短缓存的「bundle 现在开着吗」。
+   *
+   * poll 每 2 秒跑一次，而 `listBundles()` 要读每个 bundle 的 manifest 与 patch，
+   * 每次都做太重。这里缓存 3 秒：界面按钮的时效性不需要比这更灵敏，
+   * 而动作完成后用 `force` 立刻刷新一次（见 pollOnce 里 revision 变化的分支）。
+   */
+  let bundleEnabledCache = { at: 0, value: null }
+  async function currentBundleEnabled(force = false) {
+    const now = Date.now()
+    if (!force && now - bundleEnabledCache.at < 3_000) return bundleEnabledCache.value
+    const value = await bundleStillEnabled()
+    bundleEnabledCache = { at: now, value }
+    return value
   }
 
   /** 找出正在跑、且正在用 workbuddy 的会话，逐个软结束。 */
@@ -1059,20 +1089,33 @@ export function apply(ctx, config = {}) {
    * `hadRunningSession` 只统计**后台**会话：当前正在看的那个会话当然也在
    * running（用户正在跟它说话），把它算进来会让组合恒为「软结束/硬结束」。
    */
-  function withLiveActions(watermark) {
+  function withLiveActions(watermark, bundleEnabled) {
     if (watermark === null || watermark === undefined) return watermark
     const busy = hasBackgroundWorkbuddySession()
     const isPending = watermark.pendingDisable === true
     const handled = watermark.handledBy !== undefined
-    const actions = (!isPending || handled)
-      ? ['close', 'ack']
-      : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack'])
+    /**
+     * **插件已经关了就别再给「关闭插件 / 硬结束」按钮。**
+     *
+     * 用户反馈：点软结束/硬结束之后插件确实关掉了，但那条残留的水印上仍然
+     * 写着「关闭插件」——一个已经执行过的动作，点它什么也不会发生。
+     *
+     * `bundleEnabled === false` 就只留「知道了」。
+     * `=== null`（读不到状态）时保持原行为，不要因为读不到就把按钮藏了。
+     */
+    const closed = bundleEnabled === false
+    const actions = closed
+      ? ['ack']
+      : ((!isPending || handled)
+          ? ['close', 'ack']
+          : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
     const same = Array.isArray(watermark.actions)
       && watermark.actions.length === actions.length
       && watermark.actions.every((a, i) => a === actions[i])
       && watermark.hadRunningSession === busy
+      && watermark.bundleEnabled === bundleEnabled
     // 完全没变就返回原对象引用：调用方据此跳过重渲染（每 2 秒都会调一次）
-    return same ? watermark : { ...watermark, actions, hadRunningSession: busy }
+    return same ? watermark : { ...watermark, actions, hadRunningSession: busy, bundleEnabled }
   }
 
   /**
@@ -1213,7 +1256,13 @@ export function apply(ctx, config = {}) {
     await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
     await rename(tmp, file)
     publishedWatermarkRevision = snapshot.revision
-    current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
+    current = {
+      watermark: snapshot.watermark,
+      revision: snapshot.revision,
+      guardFile: file,
+      // 升级不会改变 bundle 的启用状态（升级 ≠ 启用），沿用前值
+      bundleEnabled: current.bundleEnabled ?? null,
+    }
     logger.warn?.(`[workbuddy-guard] 已挂升级水印 revision ${snapshot.revision}`
       + `（${restart ? '重启生效' : '热生效'}，来源 ${method}）`)
   }
@@ -1238,10 +1287,17 @@ export function apply(ctx, config = {}) {
     // 0) 上一次进程留下的「重启生效」水印，在首次发布之前就清掉
     const state = await clearStaleOnce(await readGuardState())
 
-    // 1) 水印：值变了就重推，没变也要刷新「后台会话」这类实时字段
+    // 1) 水印：值变了就重推，没变也要刷新「后台会话 / 插件开关」这类实时字段
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
-      current = { watermark: withLiveActions(state.watermark), revision: state.revision, guardFile: state.file }
+      // 动作刚完成时 bundle 可能刚被停用，强制刷新，别等缓存过期
+      const enabled = await currentBundleEnabled(true)
+      current = {
+        watermark: withLiveActions(state.watermark, enabled),
+        revision: state.revision,
+        guardFile: state.file,
+        bundleEnabled: enabled,
+      }
     } else if (state.watermark !== null && state.watermark !== undefined) {
       /**
        * **revision 没变也要重算 actions。**
@@ -1249,14 +1305,15 @@ export function apply(ctx, config = {}) {
        * 早先整段逻辑都包在 `if (revision 变了)` 里，于是会话停掉之后
        * 按钮组合永远停在第一次算出来的那份——用户看到「没有后台任务，
        * 却还是软结束/硬结束」。revision 只反映 guard.json 的内容版本，
-       * 与会话启停无关，必须单独刷新。
+       * 与会话启停、插件开关都无关，必须单独刷新。
        *
        * `withLiveActions` 内部做了「没变化就返回原对象」的短路，所以这里
        * 每 2 秒调一次不会造成无谓的重渲染。
        */
-      const next = withLiveActions(state.watermark)
-      if (next !== current.watermark) {
-        current = { ...current, watermark: next }
+      const enabled = await currentBundleEnabled()
+      const next = withLiveActions(state.watermark, enabled)
+      if (next !== current.watermark || enabled !== current.bundleEnabled) {
+        current = { ...current, watermark: next, bundleEnabled: enabled }
       }
     }
 
