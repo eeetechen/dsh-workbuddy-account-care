@@ -1331,6 +1331,23 @@ async function main() {
       log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → ${judgedVersion}`
         + `（来自 ${judgedFrom.join(' + ')}），而 ${BUNDLE} 仍在 ${connectInstalledVersion ?? '?'}`
         + `（基线 ${recordedConnect ?? '?'}）`)
+      /**
+       * 把「这次对不上」的版本对单独落盘一份（用户要求「本地缓存一下」）。
+       *
+       * 为什么不只放在水印里：水印对象会被界面动作反复重建
+       * （`finalizeWatermark`、`--clear-watermark`），旧版本代码重建时就把
+       * from/to 丢了，界面于是显示「? → ?」。这份记录**只由脚本在判定出
+       * 变化时写**，任何 UI 动作都不会碰它，正好当权威来源。
+       *
+       * 宿主侧的 `finalizeWatermark` 会在水印缺字段时回读它补上。
+       */
+      state.lastWbChange = {
+        at: nowIso(),
+        from: recorded,
+        to: judgedVersion,
+        connectVersion: connectInstalledVersion ?? null,
+        connectBaseline: recordedConnect ?? null,
+      }
     }
   }
 
@@ -1413,6 +1430,10 @@ async function main() {
           title: 'WB 更新了',
           body: '还用，你的账号是批发的吗？',
           detail: `${trigger.from} → ${trigger.to}`,
+          // 字段也要写：只拼 detail 的话，之后任何一次重建都会丢版本对
+          from: trigger.from,
+          to: trigger.to,
+          connectVersion: connectInstalledVersion ?? null,
         })
         issueStopSessions(
           `WorkBuddy 客户端已更新（${trigger.from} → ${trigger.to}），${BUNDLE} 已停用`,

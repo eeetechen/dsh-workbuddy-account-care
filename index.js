@@ -171,6 +171,36 @@ function guardFile() {
 }
 
 /**
+ * 读 `state.json` 里那份「最近一次 WB 版本变化」的记录，作为版本对的兜底来源。
+ *
+ * 用户要求「本地缓存一下」：一旦 `guard.json` 的水印对象丢了 `from`/`to`
+ * （旧版本代码就会丢，见 `finalizeWatermark`），界面就显示成「? → ?」。
+ * 脚本在每次判定出变化时会把这一对写进 `state.json` 的 `lastWbChange`，
+ * 它不会被后续的 UI 动作覆盖，所以适合当权威来源。
+ *
+ * 读不到就返回 null —— 调用方据此退回 '?'，不因为这里出问题就抛。
+ */
+async function readLastWbChange(guardPath) {
+  // state.json 与 guard.json 同目录；用 guard 路径推出来，避免两处各算一遍
+  const statePath = join(dirname(guardPath), 'state.json')
+  try {
+    const text = await readFile(statePath, 'utf8')
+    const parsed = JSON.parse(text)
+    const change = parsed?.lastWbChange
+    if (change === null || typeof change !== 'object') return null
+    const from = typeof change.from === 'string' ? change.from : null
+    const to = typeof change.to === 'string' ? change.to : null
+    if (from === null && to === null) return null
+    return {
+      from,
+      to,
+      connectVersion: typeof change.connectVersion === 'string' ? change.connectVersion : null,
+      at: typeof change.at === 'string' ? change.at : null,
+    }
+  } catch { return null }
+}
+
+/**
  * 在 **HMR 事务之外** 执行一段异步代码。
  *
  * 为什么需要：`@deepseek-ai/dsh-hmr` 的 `runExclusive()` 这样判断嵌套：
@@ -653,16 +683,49 @@ export function apply(ctx, config = {}) {
    *
    * `pendingDisable: false` 仍然保留：它区分「等你决定」与「已经处理过」，
    * 客户端据此决定显示门控（前者看会话，后者跟随 provider 选择）。
+   *
+   * **必须把 `from` / `to` 一起带到新对象里。**
+   *
+   * 早先这里只把它们拼进 `detail` 字符串、却没写回字段本身：
+
+   *     detail: `${previous.from ?? '?'} → ${previous.to ?? '?'}`,   // 只读
+   *     // ← 新对象里没有 from/to
+   *
+   * 于是第一次关闭时 detail 算对了；但那个对象已经把 from/to 弄丢，
+   * **第二次关闭**时 `previous.from` 就是 undefined，界面变成「? → ?」。
+   * 用户点几次「关闭插件 / 重新打开」就能复现。
    */
   async function finalizeWatermark(file, action) {
     let snapshot
     try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return null }
     const previous = snapshot.watermark ?? {}
+    /**
+     * 取版本对的兜底顺序：
+     *   · 水印自己身上的 from/to（正常情况下都有）
+     *   · **任务状态文件 `state.json` 里那份 `lastWbChange`**
+     *     —— 这是给「已经被旧版本代码弄丢过」的水印补回来的。
+     *     用户要求「本地缓存一下」，指的就是这一层：即使水印对象丢了字段，
+     *     版本对也要能从落盘的记录里恢复，而不是显示成 ?。
+     *   · 最后才是 '?'
+     */
+    const lastChange = await readLastWbChange(file)
+    const from = previous.from ?? lastChange?.from ?? null
+    const to = previous.to ?? lastChange?.to ?? null
+    const detail = (from !== null && to !== null)
+      ? `${from} → ${to}`
+      // 实在恢复不出来时，宁可沿用旧 detail 也不要把已经正确的文案覆盖成 ? → ?
+      : (typeof previous.detail === 'string' && previous.detail !== '' ? previous.detail : '? → ?')
     snapshot.watermark = {
       level: 'danger',
       title: previous.title ?? 'WB 更新了',
       body: previous.body ?? '',
-      detail: `${previous.from ?? '?'} → ${previous.to ?? '?'}`,
+      detail,
+      // 把版本对**写回字段**，下次再 finalize 才不会再丢
+      ...(from === null ? {} : { from }),
+      ...(to === null ? {} : { to }),
+      ...(previous.connectVersion === undefined && lastChange?.connectVersion === undefined
+        ? {}
+        : { connectVersion: previous.connectVersion ?? lastChange?.connectVersion }),
       pendingDisable: false,
       // 强开插件后还能在界面上关掉它
       actions: ['close', 'ack'],
