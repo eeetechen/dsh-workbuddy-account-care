@@ -69,7 +69,7 @@ import {
   readFileSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -171,8 +171,127 @@ const SIMULATE_VERSION = opt('--simulate-version', null) ?? opt('--simulate-loca
  */
 const SIMULATE_URL = opt('--simulate-url', null)
 const SIMULATE_PLUGIN = opt('--simulate-plugin', null)
-const PROFILE = opt('--profile', DEFAULT_PROFILE)
-const PROFILE_DIR = opt('--profile-dir', join(DSH_HOME, 'profiles', PROFILE))
+/**
+ * 目标 profile 的解析。
+ *
+ * 三种输入，优先级从高到低：
+ *
+ * 1. `--profile-dir` —— 显式给了目录，就不猜，目录说了算；
+ * 2. `--profile` / 配置项 `profile` —— 显式给了名字，**只认它**，不回退；
+ * 3. 什么都没给 —— 按候选顺序探测（默认 `desktop` → `web`），**第一个真正装了
+ *    `dsh-connect-workbuddy` 的胜出**。
+ *
+ * 为什么要有第 3 条：DSH Desktop 是 Electron 应用，宿主进程从托盘/快捷方式启动时
+ * **不带** `DSH_PROFILE` 环境变量，于是 `DEFAULT_PROFILE` 回落到硬编码的 `'web'`，
+ * 而用户实际用的是 `desktop` profile。结果脚本去 `profiles/web` 里找目标插件，
+ * 找不到就整轮静默跳过 —— 看起来像插件没工作，实际是查错了目录。
+ *
+ * 探测是**串行**的（不是并行）：本脚本用 `run.lock` 做全局互斥，并行会互相抢锁。
+ * 而一次探测只要读一个 `package.json`，串行的代价可以忽略。
+ *
+ * 命中判据是**磁盘上有包**（与 `isGuardTargetInstalled` 一致），不是「bundle 被
+ * 选中」：停用之后仍然要认得它，否则第二次检查就再也不会恢复判断了。
+ */
+const PROFILE_FLAG = opt('--profile', null)
+/**
+ * 候选 profile 列表。`--profiles a,b` 可显式覆盖；显式给了 `--profile` 时候选
+ * 只有它自己（显式即精确，不回退）。返回 `null` 表示「用默认候选」——
+ * 默认值在 `DEFAULT_PROFILE_CANDIDATES`，而 `config.json` 里的 `profile`
+ * 由 `resolveProfile()` 读取（那里才拿得到 CONFIG_FILE）。
+ */
+const PROFILE_CANDIDATES = (() => {
+  const raw = opt('--profiles', null)
+  const fromOpt = raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : null
+  if (fromOpt?.length) return fromOpt
+  if (PROFILE_FLAG) return [PROFILE_FLAG]
+  return null
+})()
+const EXPLICIT_PROFILE_DIR = opt('--profile-dir', null)
+const DEFAULT_PROFILE_CANDIDATES = ['desktop', 'web']
+
+/** 某个 profile 目录下有没有真正安装目标插件。 */
+function guardTargetInProfileDir(dir) {
+  return existsSync(join(dir, 'node_modules', BUNDLE, 'package.json'))
+}
+
+/**
+ * 解析出最终使用的 profile 与目录。
+ *
+ * `--profile` 显式给出时只认它（精确语义，便于排障）；否则按候选顺序探测，
+ * 命中即停；全都没命中时回落到默认候选首位，让后续走既有的
+ * 「未安装则完全静默」路径 —— 那条路径不写基线、不改 profile、不挂水印。
+ */
+function resolveProfile() {
+  if (EXPLICIT_PROFILE_DIR) {
+    // --profile-dir 最精确：目录已给定，从中反推名字只为日志好看。
+    const name = opt('--profile', null) ?? basename(EXPLICIT_PROFILE_DIR)
+    return { profile: name, profileDir: EXPLICIT_PROFILE_DIR, source: 'profile-dir', candidates: null }
+  }
+  if (PROFILE_FLAG) {
+    return {
+      profile: PROFILE_FLAG,
+      profileDir: join(DSH_HOME, 'profiles', PROFILE_FLAG),
+      source: 'explicit',
+      candidates: [PROFILE_FLAG],
+    }
+  }
+  const configured = readConfigProfile()
+  if (configured) {
+    return {
+      profile: configured,
+      profileDir: join(DSH_HOME, 'profiles', configured),
+      source: 'config',
+      candidates: [configured],
+    }
+  }
+  const candidates = PROFILE_CANDIDATES?.length ? PROFILE_CANDIDATES : DEFAULT_PROFILE_CANDIDATES
+  const tried = []
+  for (const name of candidates) {
+    const dir = join(DSH_HOME, 'profiles', name)
+    const hit = guardTargetInProfileDir(dir)
+    tried.push({ profile: name, installed: hit })
+    if (hit) return { profile: name, profileDir: dir, source: 'detected', candidates, tried }
+  }
+  const fallback = candidates[0]
+  return {
+    profile: fallback,
+    profileDir: join(DSH_HOME, 'profiles', fallback),
+    source: 'detected-miss',
+    candidates,
+    tried,
+  }
+}
+
+/** `config.json` 里显式写死的 profile（可选策略文件，坏了就当没写）。 */
+function readConfigProfile() {
+  const cfg = readJson(CONFIG_FILE, null)
+  const value = cfg?.profile
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/**
+ * 惰性解析结果：`CONFIG_FILE` / `readJson` 在下面才定义，所以第一次真正用到之前
+ * 不解析（顶层立即解析会撞 TDZ）。解析是幂等的，缓存一次即可。
+ */
+let resolvedOnce
+function resolved() {
+  resolvedOnce ??= resolveProfile()
+  return resolvedOnce
+}
+/** 目标 profile 名。用函数而不是常量，避开 TDZ；调用点统一写 PROFILE()。 */
+function PROFILE() { return resolved().profile }
+/** 目标 profile 目录。同上，调用点统一写 PROFILE_DIR()。 */
+function PROFILE_DIR() { return resolved().profileDir }
+/** 探测过程的完整结果，供 --status 暴露（来源 / 候选 / 每个候选是否命中）。 */
+function profileResolutionReport() {
+  const r = resolved()
+  return {
+    profile: r.profile,
+    source: r.source,
+    candidates: r.candidates ?? null,
+    tried: r.tried ?? null,
+  }
+}
 const STATE = opt('--state-dir', STATE_DIR)
 const DISABLE_ON_UPSTREAM = flag('--disable-on-upstream')
   || process.env.WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM === '1'
@@ -430,7 +549,7 @@ function eventKey(event) {
 // ---------------------------------------------------------------------------
 // 停用 / 恢复 bundle
 // ---------------------------------------------------------------------------
-function profileManifestPath() { return join(PROFILE_DIR, 'package.json') }
+function profileManifestPath() { return join(PROFILE_DIR(), 'package.json') }
 
 /**
  * 把 BUNDLE 从 dsh.profile.bundles 里摘掉。
@@ -507,7 +626,7 @@ function enableBundle({ dryRun }) {
       changed: false,
       reason: 'dependency-missing',
       path: manifestPath,
-      hint: `先安装：dsh plugin --profile ${PROFILE} add ${BUNDLE}`,
+      hint: `先安装：dsh plugin --profile ${PROFILE()} add ${BUNDLE}`,
     }
   }
   if (dryRun) {
@@ -546,7 +665,7 @@ function enableBundle({ dryRun }) {
  * 恢复判断了。
  */
 function isGuardTargetInstalled() {
-  const pkgPath = join(PROFILE_DIR, 'node_modules', BUNDLE, 'package.json')
+  const pkgPath = join(PROFILE_DIR(), 'node_modules', BUNDLE, 'package.json')
   const pkg = readJson(pkgPath, null)
   if (pkg?.version) {
     return { installed: true, evidence: `node_modules/${BUNDLE}@${pkg.version}`, version: pkg.version }
@@ -562,7 +681,7 @@ function isGuardTargetInstalled() {
 }
 
 function readInstalledPlugin() {
-  const manifestPath = join(PROFILE_DIR, 'node_modules', BUNDLE, 'package.json')
+  const manifestPath = join(PROFILE_DIR(), 'node_modules', BUNDLE, 'package.json')
   const pkg = readJson(manifestPath, null)
   if (pkg?.version) return { version: pkg.version, path: manifestPath }
   // 包不在但依赖声明还在：说明被 remove 过，报声明里的范围
@@ -612,7 +731,7 @@ async function readPluginLatest() {
  * 与 node_modules 的来源不一致」，而 pnpm 自己写下的事实比它重新推断的更可靠。
  */
 function detectPnpmStore() {
-  const file = join(PROFILE_DIR, 'node_modules', '.modules.yaml')
+  const file = join(PROFILE_DIR(), 'node_modules', '.modules.yaml')
   try {
     // 该文件是「带引号的 JSON 风格 YAML」，行形如：
     //   "storeDir": "/home/eaton/.local/share/pnpm/store/v10",
@@ -627,10 +746,10 @@ function detectPnpmStore() {
 
 function upgradePlugin(targetVersion, { dryRun }) {
   const spec = `${BUNDLE}@${targetVersion}`
-  const command = `dsh plugin --profile ${PROFILE} add ${spec}`
+  const command = `dsh plugin --profile ${PROFILE()} add ${spec}`
   if (dryRun) return { upgraded: false, wouldUpgrade: true, spec, command }
 
-  const run = () => execFileSync('dsh', ['plugin', '--profile', PROFILE, 'add', spec], {
+  const run = () => execFileSync('dsh', ['plugin', '--profile', PROFILE(), 'add', spec], {
     encoding: 'utf8', timeout: 300_000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, DSH_HOME },
   })
@@ -663,7 +782,7 @@ function upgradePlugin(targetVersion, { dryRun }) {
         break
       }
       try {
-        const npmrc = join(PROFILE_DIR, '.npmrc')
+        const npmrc = join(PROFILE_DIR(), '.npmrc')
         const existing = existsSync(npmrc) ? readFileSync(npmrc, 'utf8') : ''
         if (!/^store-dir=/m.test(existing)) {
           writeFileSync(npmrc, `${existing}${existing && !existing.endsWith('\n') ? '\n' : ''}store-dir=${storePin}\n`, { mode: 0o600 })
@@ -818,6 +937,14 @@ async function main() {
       logFile: LOG_FILE,
       guardFile: GUARD_FILE,
       profileManifest: profileManifestPath(),
+      /**
+       * 目标 profile 是怎么定下来的：`explicit`（--profile）、`config`
+       * （config.json 的 profile）、`detected`（按候选顺序探测命中）、
+       * `detected-miss`（全都没装，回落到候选首位）、`profile-dir`（--profile-dir）。
+       * 排障时先看这个：`detected-miss` 配 `pluginInstalled: null` 通常意味着
+       * 插件装在别的 profile 里，而当前候选列表没有覆盖到它。
+       */
+      profileResolution: profileResolutionReport(),
       bundleSelected: bundleSelected(),
       baselineVersion: state.baseline?.version ?? null,
       baselinePlatform: state.baseline?.platformId ?? null,
