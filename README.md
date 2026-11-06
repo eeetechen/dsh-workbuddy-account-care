@@ -106,7 +106,7 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 所以**扩展名不参与判定**，版本号才参与。同一版本号有 4 段数字，最后一段是构建号；
 构建哈希（`d4692421`）是十六进制、不含点，不会被误认成版本。
 
-> **只解析，不下载。** 这个插件每 3 分钟跑一次，为了一句「没看错」去拖 180MB
+> **只解析，不下载。** 这个插件每次检查只读几百字节，为了一句「没看错」去拖 180MB
 > 的安装包显然不合理。解析是纯字符串操作：拆 URL、取最后一段、跑一条正则。
 > 它也不会对链接发 HEAD 或任何请求。
 
@@ -124,7 +124,7 @@ GET https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-x64
 dsh plugin --profile web add link:/path/to/dsh-workbuddy-account-care
 
 # 2) 装 GitHub Release 里的 tarball（推荐给使用者）
-dsh plugin --profile web add /path/to/dsh-workbuddy-account-care-0.0.5.tgz
+dsh plugin --profile web add /path/to/dsh-workbuddy-account-care-0.0.6.tgz
 
 # 3) 如果以后发到了 npm
 dsh plugin --profile web add dsh-workbuddy-account-care
@@ -132,8 +132,19 @@ dsh plugin --profile web add dsh-workbuddy-account-care
 
 浏览器半（`client.js`）改完刷新页面即可，不用重启进程。
 
-**没有定时器要装。** 插件自带定时（每 3 分钟），不需要 systemd、cron、launchd，
-也不需要 DSH 的「自动化任务」。
+**没有定时器要装。** 插件自带定时：**加载完立即跑第一次**，之后每 3 分钟一次，
+不需要 systemd、cron、launchd，也不需要 DSH 的「自动化任务」。
+
+> `0.0.6` 起，首次检查不再等一个间隔。此前插件加载后会先睡满 `intervalMinutes`
+> （默认 3 分钟）才做第一次检查——而「刚装完」「刚重启」「刚在界面上点了安装」
+> 恰恰是最该看一眼的时刻。现在：
+>
+> | 时机 | 行为 |
+> |---|---|
+> | DSH 启动、bundle 加载完成 | `startupDelayMs`（默认 **3 秒**，只用来躲开 profile 收敛）后立刻检查 |
+> | 运行中安装 / 卸载 / 改启用状态 | 收到 `plugin-manager/changed` 后 **1 秒**内补跑一次 |
+> | `dsh-connect-workbuddy` 一时读不到 | 先按 **15 秒**重试，最多 4 次，再回到常规节奏 |
+> | 其余 | 每 `intervalMinutes`（默认 3 分钟）一次 |
 
 装完之后可以这样确认它在工作：
 
@@ -169,8 +180,11 @@ npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 
 ```
 dsh-workbuddy-account-care（Host 半）
-  ├─ 每 3 分钟 spawn 一次 scripts/watch.mjs
+  ├─ 加载完 → 3 秒后立刻 spawn 一次 scripts/watch.mjs
+  ├─ 运行中装/卸插件（plugin-manager/changed）→ 1 秒后补跑一次
+  ├─ 之后每 3 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
+  │     │   （插件侧读不到时先 15 秒 × 4 次短重试，避免把「还在收敛」误判成未安装）
   │     ├─ 探 5 个平台（mac×2 + win 判定，linux×2 只记录）
   │     │   ├─ 每个平台：productVersion ↔ url 文件名版本，取高
   │     │   └─ 三个判定平台之间再取高 = 判定版本
@@ -193,6 +207,33 @@ scripts/watch.mjs                  index.js（Host 半）                 client
   └─ 升级水印：带 untilRestart     │   → 清成 null、revision +1        └─ 「知道了」按 revision 记 localStorage
                                    └─ 之后每 15 秒读 guard.json
 ```
+
+## 首次执行时机
+
+检查由 Host 半自己排期，所以「什么时候跑第一次」完全是插件的行为，与 DSH
+的自动化任务无关。`0.0.6` 的行为：
+
+```
+bundle 加载
+   │  startupDelayMs（默认 3000ms）—— 只为躲开 profile 收敛，不是等一个间隔
+   ▼
+第一次检查 ──► 之后每 intervalMinutes（默认 3 分钟）
+   ▲
+   │  以下任一情况会把下一次检查**提前**到秒级：
+   │    · plugin-manager/changed（运行中安装 / 卸载 / 改启用状态）→ 1 秒
+   │    · 目标插件一时读不到（profile 还在收敛）→ 15 秒重试，最多 4 次
+```
+
+为什么不是「apply 里同步跑」：`apply()` 执行时 Cordis 的 loader 树可能还没收敛，
+此时问 `pluginManager.listBundles()` 会短暂看不到 `dsh-connect-workbuddy`，
+这一轮就会被误判成「目标未安装」而跳过。3 秒足够绝大多数机器走完收敛，又短到
+用户感觉不到；嫌慢可以设 `startupDelayMs: 0`。
+
+首次执行也会走完整的判定链路（探接口、比基线、升级插件），不是一次「预热」。
+如果目标插件确实未安装，脚本按既有规则整轮跳过、不写任何状态。
+
+对应的回归用例：`test/startup-check.test.mjs`（排期逻辑）、
+`test/e2e-startup.test.mjs`（用假 ctx 真跑一遍 `apply()`，观察脚本被派生的时刻）。
 
 ## 软结束会话
 
@@ -250,6 +291,7 @@ node node_modules/dsh-workbuddy-account-care/scripts/watch.mjs
   config:
     intervalMinutes: 3      # 内置定时间隔，分钟
     selfSchedule: true      # false = 关掉内置定时（此时不会有任何自动检查）
+    startupDelayMs: 3000    # 加载后多久跑第一次；0 = 立刻（默认就是秒级，不是等一个间隔）
     notify: true            # false = 不弹桌面通知
     pollMs: 15000           # 读指令文件的轮询间隔
 ```

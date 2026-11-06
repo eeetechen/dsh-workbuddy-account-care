@@ -11,9 +11,15 @@
  * 为什么默认不再自动停用：一个正在跑的任务被自动中止，代价比晚几秒停用大得多。
  * 需要无人值守的场景把 `config.json` 的 `autoDisable` 设成 true 即可回到旧行为。
  *
- * **谁在定时**：本插件自己。它每隔 `intervalMinutes`（默认 3）派生一次包内的
- * `scripts/watch.mjs`，后者做检测、停用与升级，并把结果写成下面这个指令文件；
- * 插件再据此软结束会话、推水印。
+ * **谁在定时**：本插件自己。**加载完立即跑第一次**，之后每隔 `intervalMinutes`
+ * （默认 3）派生一次包内的 `scripts/watch.mjs`，后者做检测、停用与升级，并把
+ * 结果写成下面这个指令文件；插件再据此软结束会话、推水印。
+ *
+ * 为什么第一次不等一个间隔（2026-11-06 改）：装完插件、或者 DSH 重启后，
+ * 用户最需要的恰恰是**那一刻**的检查结果——`dsh-connect-workbuddy` 可能已经
+ * 被升级过，也可能 WorkBuddy 客户端刚更新。等 3 分钟才第一次检查，等于把
+ * 最该防的那段窗口留成真空。改成启动即跑之后，`startupDelayMs` 仍然保留一个
+ * 很小的默认值（见下），只用来躲开 profile 收敛的瞬间，不是「等一个周期」。
  *
  * 为什么不用 DSH 的「自动化任务」：那是**按计划给会话发一条消息**——
  * 每触发一次就是一次完整的模型回合。而这件事没有任何需要模型判断的地方，
@@ -75,6 +81,59 @@ const WATCH_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'w
 
 /** 自带定时的默认间隔，分钟。 */
 const DEFAULT_INTERVAL_MINUTES = 3
+
+/**
+ * 插件加载后到第一次检查之间的默认延迟，毫秒。
+ *
+ * 不是「等一个间隔」，而是「等这一轮 Cordis 树装配完」。插件 apply 时
+ * profile 的 loader 树可能还没收敛（`pluginManager.listBundles()` 会短暂
+ * 看不到 `dsh-connect-workbuddy`，于是这一轮被误判成「目标未安装」而跳过）。
+ * 3 秒足够绝大多数机器走完收敛，又短到用户感觉不到。
+ *
+ * 设 `startupDelayMs: 0` 就真的是「apply 内同步派生」，代价是可能要多等
+ * 一个重试周期（见 `MISSING_RETRY_MS`）才能看到结果。
+ */
+const DEFAULT_STARTUP_DELAY_MS = 3_000
+
+/**
+ * 启动时发现目标插件「未安装」时的重试间隔，毫秒。
+ *
+ * 这条路径几乎只出现在启动收敛期：上一轮刚被呵护插件自己从 bundles 里摘掉，
+ * 或 profile 还没读完。等一个整周期（3 分钟）再确认太迟，所以先用短间隔
+ * 重试几次；重试完仍然没有，才回到常规节奏。
+ */
+const MISSING_RETRY_MS = 15_000
+/** 「未安装」用短间隔重试的次数上限。 */
+const MISSING_RETRY_LIMIT = 4
+
+/**
+ * 运行中「插件装了/卸了/改了启用状态」时，多久补跑一次检查，毫秒。
+ *
+ * 比 `startupDelayMs` 的默认值还短：那一刻 profile 已经落盘，不需要再等
+ * 收敛；用户点完「安装」应当几乎立刻看到结果。
+ */
+const EVENT_RECHECK_DELAY_MS = 1_000
+
+/**
+ * 一轮检查结束后，下一轮该等多久。
+ *
+ * 抽成纯函数是为了能测：真正的 `tick` 里那点分叉（未就绪就短重试、就绪就
+ * 回到常规节奏）如果埋在闭包里，只有等 3 分钟才能验证一次。
+ *
+ * @param {object} input
+ * @param {boolean|undefined} input.installed 目标插件是否已安装（`undefined` = 判不了，按已安装处理）
+ * @param {number} input.missingRetries 本轮之前已经用掉的短重试次数
+ * @param {number} input.intervalMinutes 常规间隔
+ * @returns {{ delayMs: number, missingRetries: number, event: 'retry'|'given-up'|'ok' }}
+ */
+function planNextCheck({ installed, missingRetries, intervalMinutes }) {
+  const regularMs = intervalMinutes * 60_000
+  if (installed !== false) return { delayMs: regularMs, missingRetries: 0, event: 'ok' }
+  if (missingRetries < MISSING_RETRY_LIMIT) {
+    return { delayMs: MISSING_RETRY_MS, missingRetries: missingRetries + 1, event: 'retry' }
+  }
+  return { delayMs: regularMs, missingRetries, event: 'given-up' }
+}
 
 /** 供浏览器半读取的水印/状态端点。 */
 const STATE_PATH = '/plugins/dsh-workbuddy-account-care/state'
@@ -284,8 +343,36 @@ function softStop(agent, reason, text) {
   return model
 }
 
-export const name = 'dsh-workbuddy-account-care'
+/**
+ * 解析「加载后多久跑第一次」。
+ *
+ * 默认 3 秒（`DEFAULT_STARTUP_DELAY_MS`），不是默认一个间隔——那是这次要修的
+ * 行为本身。允许显式 `0`（同步内的下一个 tick 就派生），也允许「改大」来给
+ * 慢机器上的 profile 收敛留时间。
+ *
+ * 为什么不用 `Number(x) >= 0` 一把梭：`Number(null)` === 0、`Number('')` === 0、
+ * `Number([])` === 0。配置没写这个键时 `config.startupDelayMs` 就是 `undefined`，
+ * 一旦被当成 0，「等一会儿」的默认值会被静默吃掉。所以先看类型。
+ */
+function resolveStartupDelayMs(raw) {
+  if (typeof raw !== 'number' && typeof raw !== 'string') return DEFAULT_STARTUP_DELAY_MS
+  if (typeof raw === 'string' && raw.trim() === '') return DEFAULT_STARTUP_DELAY_MS
+  const ms = Number(raw)
+  if (!Number.isFinite(ms) || ms < 0) return DEFAULT_STARTUP_DELAY_MS
+  return ms
+}
 
+/**
+ * 「刚装载/卸载/改启用」这类事件到达时，把下一次检查提前到多久。
+ *
+ * 与 `startupDelayMs` 取小值：事件发生时 profile 已经落盘，不需要再等收敛；
+ * 若用户把 `startupDelayMs` 配成 0，那这里也应当跟着是 0。
+ */
+function resolveRecheckDelayMs(startupDelayMs) {
+  return Math.min(startupDelayMs, EVENT_RECHECK_DELAY_MS)
+}
+
+export const name = 'dsh-workbuddy-account-care'
 /**
  * 这些服务缺失时插件保持惰性，而不是把整个 profile 弄挂。
  *
@@ -647,6 +734,8 @@ export function apply(ctx, config = {}) {
   const intervalMinutes = Number(config.intervalMinutes) > 0
     ? Number(config.intervalMinutes)
     : DEFAULT_INTERVAL_MINUTES
+  /** 加载后到第一次检查的延迟（默认 3 秒），见 `resolveStartupDelayMs`。 */
+  const startupDelayMs = resolveStartupDelayMs(config.startupDelayMs)
 
   /**
    * 被呵护插件的插件是否装在本机。
@@ -674,12 +763,38 @@ export function apply(ctx, config = {}) {
       let alive = true
       let timer
       let loggedMissing = false
+      /** 本轮「目标未安装」已经用掉的短重试次数；一轮真正检查过就归零。 */
+      let missingRetries = 0
+      /** 一次检查还没跑完。并发派生两个脚本没有意义：它们会互相抢 `run.lock`。 */
+      let inFlight = false
+      /** 检查进行中收到「该再看一眼」的请求；结束后立刻补跑，不丢事件。 */
+      let recheckRequested = false
+
+      const arm = (delayMs) => {
+        if (!alive) return
+        if (timer !== undefined) clearTimeout(timer)
+        timer = setTimeout(tick, delayMs)
+        timer?.unref?.()
+      }
+
       const tick = async () => {
         if (!alive) return
+        timer = undefined
+        if (inFlight) {
+          // 已经有一轮在跑：记下来，等它结束再补跑，绝不并发
+          recheckRequested = true
+          return
+        }
+        inFlight = true
+        let installed
         try {
-          const installed = await guardTargetInstalled()
+          installed = await guardTargetInstalled()
           if (installed === false) {
-            if (!loggedMissing) {
+            const plan = planNextCheck({ installed, missingRetries, intervalMinutes })
+            if (plan.event === 'retry') {
+              // 启动收敛期最常见：别按 3 分钟算，先用短间隔确认一次再认命
+              logger.warn?.(`[workbuddy-guard] ${GUARDED_BUNDLE} 暂未就绪，${Math.round(MISSING_RETRY_MS / 1000)} 秒后重试（${plan.missingRetries}/${MISSING_RETRY_LIMIT}）`)
+            } else if (!loggedMissing) {
               logger.warn?.(`[workbuddy-guard] ${GUARDED_BUNDLE} 未安装，呵护插件保持静默（装上后自动开始）`)
               loggedMissing = true
             }
@@ -692,17 +807,47 @@ export function apply(ctx, config = {}) {
           }
         } catch (error) {
           logger.error?.(`[workbuddy-guard] 定时检查失败: ${error?.message || error}`)
+        } finally {
+          inFlight = false
         }
-        if (alive) timer = setTimeout(tick, intervalMinutes * 60_000)
-        timer?.unref?.()
+        const plan = planNextCheck({ installed, missingRetries, intervalMinutes })
+        missingRetries = plan.missingRetries
+        if (!alive) return
+        if (recheckRequested) {
+          // 跑这一轮的时候又有人要求补跑：用事件的短延迟，而不是等下一个周期
+          recheckRequested = false
+          arm(resolveRecheckDelayMs(startupDelayMs))
+          return
+        }
+        arm(plan.delayMs)
       }
-      // 启动不立刻跑：进程刚起来时 profile 可能还在收敛，等一个间隔
-      timer = setTimeout(tick, intervalMinutes * 60_000)
-      timer?.unref?.()
-      logger.warn?.(`[workbuddy-guard] 自带定时已启用：每 ${intervalMinutes} 分钟检查一次`)
+
+      /**
+       * 「刚装上/刚卸掉/刚改过启用状态」也属于该立刻看一眼的时刻。
+       *
+       * 这条订阅补的是**运行中安装**：用户在界面上点「安装」或执行
+       * `dsh plugin add` 之后，本插件不会重新 apply（HMR 一般不重载 Host），
+       * 如果只靠定时器，装完仍要等一个间隔才第一次检查。事件一到就把排期
+       * 提前到秒级——`plugin-manager/changed` 在 manager 的操作结束时同步发出，
+       * 此时 profile 已落盘，正好是检查的最佳时机。
+       */
+      const offChanged = ctx.on?.('plugin-manager/changed', () => {
+        if (!alive) return
+        if (inFlight) {
+          recheckRequested = true
+          return
+        }
+        arm(resolveRecheckDelayMs(startupDelayMs))
+      })
+
+      // 加载完立即跑第一次：装完插件 / 重启 DSH 的那一刻最该看一眼。
+      // startupDelayMs 只用来躲开 profile 收敛，不是一个完整周期。
+      arm(startupDelayMs)
+      logger.warn?.(`[workbuddy-guard] 自带定时已启用：加载后 ${Math.round(startupDelayMs / 1000)} 秒首次检查，之后每 ${intervalMinutes} 分钟一次`)
       return () => {
         alive = false
         if (timer !== undefined) clearTimeout(timer)
+        if (typeof offChanged === 'function') offChanged()
       }
     }, 'workbuddy-guard: self schedule')
   } else {
@@ -737,4 +882,4 @@ export const DEFAULT_WATERMARK = {
 }
 
 /** 测试出口：不参与插件契约，只有 test/ 里的用例 import 它。 */
-export { usesWorkbuddy }
+export { usesWorkbuddy, resolveStartupDelayMs, resolveRecheckDelayMs, planNextCheck, DEFAULT_STARTUP_DELAY_MS, MISSING_RETRY_MS, MISSING_RETRY_LIMIT, EVENT_RECHECK_DELAY_MS }

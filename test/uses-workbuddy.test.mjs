@@ -6,7 +6,13 @@
 //
 // 跑：node test/uses-workbuddy.test.mjs
 import assert from 'node:assert/strict'
-import { usesWorkbuddy } from '../index.js'
+import {
+  usesWorkbuddy,
+  resolveStartupDelayMs,
+  DEFAULT_STARTUP_DELAY_MS,
+  MISSING_RETRY_MS,
+  MISSING_RETRY_LIMIT,
+} from '../index.js'
 
 /** 造一个够用的 agent 假体：只看 ownEvents 与 options。 */
 function fakeAgent({ options = {}, lastAssistant = null } = {}) {
@@ -89,6 +95,37 @@ test('session.ownEvents 抛错 → 当成没有 assistant 消息', () => {
     session: { ownEvents: () => { throw new Error('boom') } },
   }
   assert.equal(usesWorkbuddy(agent, undefined), null)
+})
+
+// ---- 首次检查时机：加载后立即跑，而不是等一个间隔 ----
+//
+// 起因（2026-11-06）：装完插件 / 重启 DSH 之后要等满 3 分钟才第一次检查，
+// 而那正是最该看一眼的时刻。这里锁住「默认值是秒级延迟」这件事——将来谁
+// 把默认值改回 intervalMinutes，这几条会先红。
+test('startupDelayMs 缺省 → 用秒级默认值，不是一个间隔', () => {
+  const ms = resolveStartupDelayMs(undefined)
+  assert.equal(ms, DEFAULT_STARTUP_DELAY_MS)
+  assert.ok(ms <= 10_000, `默认首次延迟必须远小于一个间隔，实际 ${ms}ms`)
+})
+
+test('startupDelayMs 显式 0 → 立刻（允许用配置关掉延迟）', () => {
+  assert.equal(resolveStartupDelayMs(0), 0)
+})
+
+test('startupDelayMs 允许改大、也接受数字字符串', () => {
+  assert.equal(resolveStartupDelayMs(12_000), 12_000)
+  assert.equal(resolveStartupDelayMs('2500'), 2_500)
+})
+
+test('startupDelayMs 配成垃圾/负数/null/空串 → 退回默认（不能被当成 0）', () => {
+  for (const bad of [null, '', '   ', 'abc', NaN, -1, Infinity, {}, [], true]) {
+    assert.equal(resolveStartupDelayMs(bad), DEFAULT_STARTUP_DELAY_MS, `${JSON.stringify(bad)} 应退回默认`)
+  }
+})
+
+test('目标未就绪的重试间隔必须短于常规间隔', () => {
+  assert.ok(MISSING_RETRY_MS < 3 * 60_000)
+  assert.ok(MISSING_RETRY_LIMIT >= 1)
 })
 
 let failed = 0
