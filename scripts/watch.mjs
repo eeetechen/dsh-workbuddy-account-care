@@ -2,7 +2,7 @@
 /**
  * dsh-workbuddy 账号呵护 (WorkBuddy Account Care)
  * ---------------------------------------------------------------------------
- * 每 3 分钟问一次 WorkBuddy 官方的版本接口。只要接口给的版本号和本地记录的
+ * 每 1 分钟问一次 WorkBuddy 官方的版本接口。只要接口给的版本号和本地记录的
  * 基点版本号对不上，就认为「客户端已经更新」，于是挂水印 / 停用 bundle
  * `dsh-connect-workbuddy` / 弹桌面通知。
  *
@@ -309,7 +309,7 @@ const NPM_LATEST_URL = `https://registry.npmjs.org/${BUNDLE}/latest`
 /**
  * 抢一个以进程存活为判据的锁。
  *
- * 两个执行器（systemd timer 每 3 分钟、DSH 内 schedule 每 3 分钟）撞在一起时，
+ * 两个执行器（systemd timer 每 1 分钟、DSH 内 schedule 每 1 分钟）撞在一起时，
  * 第二个必须安静退出：并发地读-改-写同一个 profile / 同一个 state.json 会把
  * 两边都写成半成品。锁记录 pid 与启动时间，发现持有者已经不在就抢占。
  */
@@ -390,7 +390,7 @@ function log(level, message) {
   const line = `${nowIso()} [${level}] ${message}\n`
   try {
     mkdirSync(STATE, { recursive: true })
-    // 每 3 分钟一行，一天 480 行；超过 512KB 就留最后 2000 行重新开始
+    // 每 1 分钟一行，一天 1440 行；超过 512KB 就留最后 2000 行重新开始
     try {
       if (statSync(LOG_FILE).size > 512 * 1024) {
         const kept = readFileSync(LOG_FILE, 'utf8').split('\n').slice(-2000).join('\n')
@@ -498,7 +498,7 @@ function expectedFilenamePlatform(platformId = PLATFORM_ID) {
 /**
  * 从下载链接里取出文件名与版本号。
  *
- * **纯字符串处理**：不发请求、不读文件、不校验 sha256。这个呵护插件每 3 分钟跑
+ * **纯字符串处理**：不发请求、不读文件、不校验 sha256。这个呵护插件每轮都跑
  * 一次，为了「确认自己没看错」去拖 180MB 的安装包显然不合理；而文件名本身
  * 就是发布流水线的产物，格式稳定（实测两个平台都是这个形状）：
  *
@@ -764,13 +764,13 @@ function readGuardFile() {
 /**
  * 下发「把插件升级到 <version>」的指令，交给宿主进程执行。
  *
- * **为什么要去重**：脚本每 3 分钟跑一轮。宿主可能还没执行（进程刚起、
+ * **为什么要去重**：脚本每轮都要跑。宿主可能还没执行（进程刚起、
  * 上一轮还在装），没有去重就会把 revision 越推越高，宿主每次升级都以为是
  * 新指令，于是并发装同一个包。所以同一个 `from → to` 只下发一次，
  * 除非上一次已经明确 `done` 或 `failed`。
  *
  * **为什么要限次**：装包可能持续性失败（网络、权限、registry 不可达）。
- * 失败后若无条件重发，就会变成每 3 分钟一次的无限重试，日志被刷满、
+ * 失败后若无条件重发，就会变成每轮一次的无限重试，日志被刷满、
  * 还把 profile 的 pnpm 锁反复占住。这里给 2 次上限，用尽后只记录、
  * 不再下发 —— 由用户手动处理。
  */
@@ -845,7 +845,7 @@ function updateWatermark(watermark) {
  * 下发一次「软结束会话」指令。
  *
  * 一次更新只该出现一条这样的指令：反复下发会让每条在用 workbuddy 的会话
- * 每 3 分钟被插一条消息。所以指令的 identity 是「本机版本变化」这件事本身，
+ * 每轮都被插一条消息。所以指令的 identity 是「本机版本变化」这件事本身，
  * 同一个 from→to 只发一次。
  */
 function issueStopSessions(reason, text, from, to) {
@@ -1077,24 +1077,44 @@ async function main() {
    */
   const probes = platformsToProbe()
   const platformResults = []
-  for (const probe of probes) {
-    const platformId = probe.id
-    const iface = simulated
-      ? {
+
+  /**
+   * **五个平台并行探，不要串行 await。**
+   *
+   * 原来这里是 `for (… of probes) { const iface = await readPlatform(…) }`，
+   * 五个 HTTP 请求一个接一个发：单轮实测 2.8 秒，其中九成时间在等网络。
+   * 串行没有任何好处——五个平台互不依赖，结果最后才一起参与判定。
+   *
+   * 并发之后单轮降到接近最慢那一个请求的耗时（通常 0.5～1 秒）。
+   * 顺序仍然保留：`platformResults` 按 `probes` 的原顺序填，`judgedFrom`
+   * 依赖这个顺序输出「谁把版本抬到了判定值」。
+   *
+   * 失败隔离：`readPlatform` 内部把网络错误转成 `{ok:false,error}`，
+   * 不会 reject，所以单个平台挂掉不影响其它四个。
+   */
+  const fetched = await Promise.all(probes.map((probe) => {
+    if (simulated) {
+      return {
         ok: true,
-        platformId,
+        platformId: probe.id,
         version: SIMULATE_VERSION,
         // 演练不联网，但要造一个形状真实的链接，好让文件名解析那一路也真的跑一遍
         // 换链接只对本机那一路生效，否则三个判定平台都会拿到同一个文件名，
         // 模拟出来的「各平台自洽」就是假的（真链路里每个平台取自己响应里的 url）。
-        url: (SIMULATE_URL !== null && platformId === PLATFORM_ID)
+        url: (SIMULATE_URL !== null && probe.id === PLATFORM_ID)
           ? SIMULATE_URL
-          : `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(platformId)}/`
-            + `WorkBuddy-${expectedFilenamePlatform(platformId)}-${SIMULATE_VERSION}-d4692421.zip`,
+          : `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(probe.id)}/`
+            + `WorkBuddy-${expectedFilenamePlatform(probe.id)}-${SIMULATE_VERSION}-d4692421.zip`,
         publishedAt: null,
         simulated: true,
       }
-      : await readPlatform(platformId, probe.url ?? upstreamUrlFor(platformId))
+    }
+    return readPlatform(probe.id, probe.url ?? upstreamUrlFor(probe.id))
+  }))
+
+  for (const [index, probe] of probes.entries()) {
+    const platformId = probe.id
+    const iface = fetched[index]
     // 演练「换链接」：只替换本机那一路，其它平台保持自洽
     if (!simulated && SIMULATE_URL !== null && platformId === PLATFORM_ID) {
       iface.url = SIMULATE_URL

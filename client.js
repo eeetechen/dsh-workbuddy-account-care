@@ -42,7 +42,20 @@ window.__ModuleLoader__.load({
     const h = React.createElement
 
     const STATE_URL = '/plugins/dsh-workbuddy-account-care/state'
-    const POLL_MS = 30_000
+    /**
+     * 拉取水印的间隔。
+     *
+     * 这是**三段轮询里最靠近用户的一段**：宿主已经把值准备好了，浏览器晚多久
+     * 拉就晚多久看见。原来 30 秒太钝——用户从触发到看见最坏要等 3.75 分钟，
+     * 而这一段就占了 30 秒。
+     *
+     * 5 秒的代价很小：一个 GET、几百字节、命中内存里的值。真正需要省的是
+     * 段①（派生 Node 子进程去探 5 个平台的接口），不是这一段。
+     *
+     * 只在标签页可见时轮询（见下方的 visibilitychange）：后台标签不拉，
+     * 所以「用户开着 10 个后台标签」不会变成 10 倍压力。
+     */
+    const POLL_MS = 5_000
     const STYLE_ID = 'dsh-workbuddy-account-care:styles'
     /** 退场动画时长；到点再真正卸载卡片。 */
     const LEAVE_MS = 180
@@ -246,7 +259,10 @@ window.__ModuleLoader__.load({
           } catch { /* 端点没准备好就等下一轮 */ }
         }
         const tick = async () => {
-          await load()
+          // 只在可见时轮询：后台标签页没有任何人看，拉也没有意义，
+          // 而且开着多个标签时会把宿主的 /state 打成 N 倍流量。
+          // 切回前台由 visibilitychange 立刻补一次，所以看不到「延迟」。
+          if (document.visibilityState !== 'hidden') await load()
           if (alive) timer = setTimeout(tick, POLL_MS)
         }
         void tick()

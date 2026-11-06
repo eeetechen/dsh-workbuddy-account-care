@@ -132,19 +132,31 @@ dsh plugin --profile web add dsh-workbuddy-account-care
 
 浏览器半（`client.js`）改完刷新页面即可，不用重启进程。
 
-**没有定时器要装。** 插件自带定时：**加载完立即跑第一次**，之后每 3 分钟一次，
+**没有定时器要装。** 插件自带定时：**加载完立即跑第一次**，之后每 1 分钟一次，
 不需要 systemd、cron、launchd，也不需要 DSH 的「自动化任务」。
 
-> `0.0.6` 起，首次检查不再等一个间隔。此前插件加载后会先睡满 `intervalMinutes`
-> （默认 3 分钟）才做第一次检查——而「刚装完」「刚重启」「刚在界面上点了安装」
-> 恰恰是最该看一眼的时刻。现在：
+> `0.0.6` 起，首次检查不再等一个间隔，并且把整条延迟压到 **≤1.5 分钟**。
+>
+> **从触发到看见水印，要经过三段轮询**，它们原来是串联浪费的：
+>
+> | 段 | 做什么 | 旧 | 新 |
+> |---|---|---|---|
+> | ① | 派生 `watch.mjs` 探官方版本接口 | 3 分钟 | **1 分钟** |
+> | ② | 宿主读 `guard.json` 并发布水印 | 15 秒 | **2 秒**（脚本跑完还会立刻同步一次） |
+> | ③ | 浏览器拉 `/plugins/…/state` | 30 秒 | **5 秒**（仅标签页可见时） |
+> | | **最坏合计** | **3 分 45 秒** | **约 1 分 7 秒** |
+>
+> 另外 `watch.mjs` 里五个平台的探测原来是 `for` 循环里逐个 `await`，
+> 串行等于五个 HTTP 请求排队；改成 `Promise.all` 后单轮从 **2.8 秒降到 0.85 秒**。
+>
+> 各时机的行为：
 >
 > | 时机 | 行为 |
 > |---|---|
 > | DSH 启动、bundle 加载完成 | `startupDelayMs`（默认 **3 秒**，只用来躲开 profile 收敛）后立刻检查 |
 > | 运行中安装 / 卸载 / 改启用状态 | 收到 `plugin-manager/changed` 后 **1 秒**内补跑一次 |
 > | `dsh-connect-workbuddy` 一时读不到 | 先按 **15 秒**重试，最多 4 次，再回到常规节奏 |
-> | 其余 | 每 `intervalMinutes`（默认 3 分钟）一次 |
+> | 其余 | 每 `intervalMinutes`（默认 **1 分钟**）一次 |
 
 装完之后可以这样确认它在工作：
 
@@ -182,10 +194,10 @@ npx dsh-workbuddy-account-care where     # 各条路径 + 当前定时来源
 dsh-workbuddy-account-care（Host 半）
   ├─ 加载完 → 3 秒后立刻 spawn 一次 scripts/watch.mjs
   ├─ 运行中装/卸插件（plugin-manager/changed）→ 1 秒后补跑一次
-  ├─ 之后每 3 分钟 spawn 一次 scripts/watch.mjs
+  ├─ 之后每 1 分钟 spawn 一次 scripts/watch.mjs
   │     ├─ 前置检查：dsh-connect-workbuddy 装了吗？没装 → 直接退出
   │     │   （插件侧读不到时先 15 秒 × 4 次短重试，避免把「还在收敛」误判成未安装）
-  │     ├─ 探 5 个平台（mac×2 + win 判定，linux×2 只记录）
+  │     ├─ 并行探 5 个平台（mac×2 + win 判定，linux×2 只记录）
   │     │   ├─ 每个平台：productVersion ↔ url 文件名版本，取高
   │     │   └─ 三个判定平台之间再取高 = 判定版本
   │     ├─ 读 npm 上 dsh-connect-workbuddy 的 latest
@@ -196,7 +208,8 @@ dsh-workbuddy-account-care（Host 半）
   │   （升级不由脚本执行：脚本是 node 派生的独立进程，
   │     在 Desktop 里没有 dsh 命令可用，见下节）
   │
-  └─ 每 15 秒读一次 guard.json
+  ├─ 脚本退出时立刻同步一次（不等下一轮轮询）
+  └─ 每 2 秒读一次 guard.json
         ├─ 水印 → 经 HTTP 端点给浏览器半，由它在 shell.overlay 里画
         ├─ upgrade 指令 → 按环境挑一条路执行安装，结果回写 guard.json
         └─ 软结束指令 → cancel 正在跑的轮次 + followup 一条「本机 provider 已更新…」
@@ -234,16 +247,17 @@ npx dsh-workbuddy-account-care check --status
 # → "upgrade": {"status":"done","method":"host-service","application":"applied", …}
 ```
 
-同一个 `from → to` 只会下发一次；失败后最多重试 2 次（防每 3 分钟无限重试）。
+同一个 `from → to` 只会下发一次；失败后最多重试 2 次（防每轮无限重试）。
 
 水印的生命周期分在两半，各管一段：
 
 ```
 scripts/watch.mjs                  index.js（Host 半）                 client.js（浏览器半）
-  ├─ 写 watermark{at}              ├─ 首次 poll 先判过期：             ├─ 每 30 秒 / 切回标签页拉一次
+  ├─ 写 watermark{at}              ├─ 首次 poll 先判过期：             ├─ 每 5 秒 / 切回标签页拉一次
   ├─ 危险水印：不带 untilRestart   │   untilRestart 且 at < 启动时刻    ├─ 玻璃卡在 shell.overlay 里淡入
   └─ 升级水印：带 untilRestart     │   → 清成 null、revision +1        └─ 「知道了」按 revision 记 localStorage
-                                   └─ 之后每 15 秒读 guard.json
+                                   ├─ 脚本退出后立刻同步一次
+                                   └─ 之后每 2 秒读 guard.json
 ```
 
 ## 首次执行时机
@@ -255,7 +269,7 @@ scripts/watch.mjs                  index.js（Host 半）                 client
 bundle 加载
    │  startupDelayMs（默认 3000ms）—— 只为躲开 profile 收敛，不是等一个间隔
    ▼
-第一次检查 ──► 之后每 intervalMinutes（默认 3 分钟）
+第一次检查 ──► 之后每 intervalMinutes（默认 1 分钟）
    ▲
    │  以下任一情况会把下一次检查**提前**到秒级：
    │    · plugin-manager/changed（运行中安装 / 卸载 / 改启用状态）→ 1 秒

@@ -12,18 +12,18 @@
  * 需要无人值守的场景把 `config.json` 的 `autoDisable` 设成 true 即可回到旧行为。
  *
  * **谁在定时**：本插件自己。**加载完立即跑第一次**，之后每隔 `intervalMinutes`
- * （默认 3）派生一次包内的 `scripts/watch.mjs`，后者做检测、停用与升级，并把
+ * （默认 1）派生一次包内的 `scripts/watch.mjs`，后者做检测、停用与升级，并把
  * 结果写成下面这个指令文件；插件再据此软结束会话、推水印。
  *
  * 为什么第一次不等一个间隔（2026-11-06 改）：装完插件、或者 DSH 重启后，
  * 用户最需要的恰恰是**那一刻**的检查结果——`dsh-connect-workbuddy` 可能已经
- * 被升级过，也可能 WorkBuddy 客户端刚更新。等 3 分钟才第一次检查，等于把
+ * 被升级过，也可能 WorkBuddy 客户端刚更新。等一个间隔才第一次检查，等于把
  * 最该防的那段窗口留成真空。改成启动即跑之后，`startupDelayMs` 仍然保留一个
  * 很小的默认值（见下），只用来躲开 profile 收敛的瞬间，不是「等一个周期」。
  *
  * 为什么不用 DSH 的「自动化任务」：那是**按计划给会话发一条消息**——
  * 每触发一次就是一次完整的模型回合。而这件事没有任何需要模型判断的地方，
- * 3 分钟一次就是一天 480 个回合、换 480 句「无变化」。定时器要在进程里，
+ * 一分钟一次就是一天 1440 个回合、换 1440 句「无变化」。定时器要在进程里，
  * 不要经过模型。
  *
  * 为什么仍然由**脚本**而不是插件自己判停用：派生出去的进程是独立的一份代码，
@@ -74,14 +74,36 @@ const BOOT_AT_MS = Date.now()
 const GUARDED_BUNDLE = 'dsh-connect-workbuddy'
 /** 会被当成「正在用 WorkBuddy」的 provider 前缀。 */
 const GUARDED_PROVIDERS = ['workbuddy', 'workbuddy-global']
-/** 状态文件轮询间隔：脚本每 3 分钟跑一次，15 秒足够及时且几乎不耗资源。 */
-const POLL_MS = 15_000
+/**
+ * 读 `guard.json` 的间隔。
+ *
+ * 这里读的是**本地一个小 JSON 文件**，成本微乎其微；真正贵的是派生
+ * `watch.mjs` 去探五个平台的接口。所以这一环没理由慢——原来 15 秒意味着
+ * 脚本早就写好了水印，用户还要再白等最多 15 秒才可能看到。
+ *
+ * 2 秒：最坏多等 2 秒，每秒一次 stat + 偶尔 read，可以忽略。
+ * 注意这里**不能**用 0/极小值：轮询会对同一个文件反复 stat，而脚本是用
+ * 「写临时文件再 rename」的原子方式落盘的，读不到半截文件。
+ */
+const POLL_MS = 2_000
 
 /** 包内检查脚本的绝对路径（本文件与它同在包根下）。 */
 const WATCH_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'watch.mjs')
 
-/** 自带定时的默认间隔，分钟。 */
-const DEFAULT_INTERVAL_MINUTES = 3
+/**
+ * 自带定时的默认间隔，分钟。
+ *
+ * 这是**三段延迟里最大的一段**：脚本每一轮才探一次五个平台的版本接口，
+ * 所以「WB 发了新版」到「水印出现」的最坏等待就等于这个间隔。
+ *
+ * 从 3 分钟降到 1 分钟：用户实际感知从「最多 3.75 分钟」降到「最多 1.5 分钟」。
+ * 代价是每小时多跑两轮：每轮 5 个 HTTP 请求 + 一个 Node 子进程（实测 2.8 秒）。
+ * 这些接口是官方更新检查接口，请求量级和客户端自己检查一次更新相当，
+ * 一分钟一次不算异常流量。
+ *
+ * 想更激进就配 `intervalMinutes`（插件 Config 已暴露），想省流量就配大。
+ */
+const DEFAULT_INTERVAL_MINUTES = 1
 
 /**
  * 插件加载后到第一次检查之间的默认延迟，毫秒。
@@ -217,7 +239,7 @@ async function runOutsideHmr(ctx, operation) {
  * reconcile，`apply()` 里的首轮 poll 就同步跑了起来），就会撞上嵌套限制。
  *
  * 这类失败不是「升级本身有问题」，所以**不该消耗重试次数**——否则两次偶然
- * 的时序冲突就会把自动升级判死。交给下一轮（15 秒 / 3 分钟）重试即可。
+ * 的时序冲突就会把自动升级判死。交给下一轮（2 秒 / 1 分钟）重试即可。
  */
 function isTransientUpgradeError(value) {
   const text = String(value?.message ?? value?.error?.diagnostic ?? value?.error?.code ?? value ?? '')
@@ -772,7 +794,7 @@ export function apply(ctx, config = {}) {
           skipped.push({ sessionId: agent.id, model, status })
           continue
         }
-        // 已经软结束过就不再重复插一条，否则每 3 分钟一轮会堆满收件箱
+        // 已经软结束过就不再重复插一条，否则每轮检查都会堆满收件箱
         const inboxText = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])]
           .map((m) => textOf(m.content))
           .join('\n')
@@ -1028,8 +1050,23 @@ export function apply(ctx, config = {}) {
     current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
   }
 
-  /** 读一次状态文件，按 revision 执行应该执行的动作。 */
-  async function poll() {
+  /**
+   * 读一次状态文件，按 revision 执行应该执行的动作。
+   *
+   * **串行化**：现在有两个入口会调它——2 秒一次的轮询，以及每次派生
+   * `watch.mjs` 结束后立刻同步一次。两者可能重叠。虽然 `handled*Revision`
+   * 让动作本身幂等，但并发执行会让 `runUpgrade` 被同时触发两次（同一条指令
+   * 真的装两遍包）。所以这里用一条 Promise 链把它们排成队列。
+   */
+  let pollChain = Promise.resolve()
+  function poll() {
+    const run = pollChain.then(() => pollOnce())
+    // 链条本身不能断：某一轮抛错也要让后续轮次继续
+    pollChain = run.catch(() => {})
+    return run
+  }
+
+  async function pollOnce() {
     // 0) 上一次进程留下的「重启生效」水印，在首次发布之前就清掉
     const state = await clearStaleOnce(await readGuardState())
 
@@ -1133,7 +1170,7 @@ export function apply(ctx, config = {}) {
   /**
    * 被呵护插件的插件是否装在本机。
    *
-   * 没装就**不派生进程**：脚本自己也会判一次，但这里先挡一道，省掉每 3 分钟
+   * 没装就**不派生进程**：脚本自己也会判一次，但这里先挡一道，省掉每轮
    * 一个必然空转的子进程，也避免在没有那个插件的环境里留下任何状态文件。
    *
    * `installed` 是「profile 声明了这个依赖」，与「是否被选中」无关 —— 呵护插件
@@ -1196,6 +1233,14 @@ export function apply(ctx, config = {}) {
             const outcome = await runWatchOnce()
             if (outcome.result?.changed) {
               logger.warn?.(`[workbuddy-guard] 定时检查：${outcome.result.note ?? '有变化'}`)
+            }
+            // 脚本刚写完 guard.json，**立刻**同步一遍，不要等下一轮 POLL_MS。
+            //
+            // 这是三段延迟里最容易砍掉的一段：脚本是这个进程自己派生的，
+            // 它退出时我们正好知道「现在文件是最新的」。原来要等宿主下一次
+            // 轮询（15 秒）才把新水印发布出去——纯粹的白等。
+            try { await poll() } catch (error) {
+              logger.error?.(`[workbuddy-guard] 检查后同步失败: ${error?.message || error}`)
             }
           }
         } catch (error) {
