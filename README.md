@@ -294,7 +294,55 @@ node node_modules/dsh-workbuddy-account-care/scripts/watch.mjs
     startupDelayMs: 3000    # 加载后多久跑第一次；0 = 立刻（默认就是秒级，不是等一个间隔）
     notify: true            # false = 不弹桌面通知
     pollMs: 15000           # 读指令文件的轮询间隔
+    profile: desktop        # 目标 profile（强烈建议显式写，见下）
 ```
+
+### ⚠️ 请显式配置 `profile`
+
+**这一项建议每个用户都显式写上**，尤其是用 **DSH Desktop（Electron 客户端）** 的：
+
+```yaml
+    profile: desktop        # Desktop 用户
+    # profile: web          # 命令行 `dsh web` 用户（这也是不写时的默认候选首位）
+```
+
+**为什么必须显式配**：本插件的检测脚本需要知道「去哪个 profile 里找 `dsh-connect-workbuddy`」。
+它读的是 `config.profile` → 环境变量 `DSH_PROFILE` → 默认值。但 **DSH Desktop 是 Electron
+应用，宿主进程从托盘/快捷方式启动时不带 `DSH_PROFILE` 环境变量**，于是取值回落到默认，
+而用户实际用的往往不是那个 profile。结果是脚本去错的目录里找目标插件，报
+「未安装」，然后**整轮静默跳过**——看起来像插件没工作，实际是查错了地方。
+
+排查这种「什么都没发生」时，先看 `--status` 的 `profileResolution.source`：
+`detected-miss` 配 `pluginInstalled: null` 基本就是这个原因。
+
+**不配也能工作**（0.0.6 起）：没给 `--profile`、没给 `config.profile`、也没有 `DSH_PROFILE`
+时，脚本会**按候选顺序串行探测**，第一个真正装了 `dsh-connect-workbuddy` 的 profile 胜出。
+默认候选顺序是 `desktop` → `web`（Desktop 优先，因为那是 Electron 用户最常见的形态）。
+
+三种输入，优先级从高到低：
+
+| 顺序 | 来源 | 行为 |
+|---|---|---|
+| 1 | `--profile-dir <目录>` | 目录说了算，名字只用于日志 |
+| 2 | `--profile <名字>` / `config.profile` | **只认它，不回退**（显式即精确，便于排障） |
+| 3 | 都没有 | 按候选顺序探测；全都没装则回落到候选首位，走「未安装则完全静默」路径 |
+
+候选顺序也可以显式覆盖：
+
+```jsonc
+// ~/.dsh/workbuddy-update-watch/config.json 里
+{ "profile": "desktop" }              // 等价于 config.profile，但不必重启 DSH
+```
+
+命令行临时指定：
+
+```bash
+node scripts/watch.mjs --profile desktop --check    # 只查这一个，不回退
+node scripts/watch.mjs --profiles web,desktop --check   # 自定义探测顺序
+```
+
+> 探测是**串行**的，不是并行：脚本用 `run.lock` 做全局互斥，并行会互相抢锁。
+> 单次探测只读一个 `package.json`，串行代价可以忽略。
 
 策略文件 `~/.dsh/workbuddy-update-watch/config.json`：
 
@@ -306,13 +354,14 @@ node node_modules/dsh-workbuddy-account-care/scripts/watch.mjs
 |---|---|
 | `autoDisable` | `false`（**默认**）= 检测到先挂提示，由你在界面上选；`true` = 检测到就当场停用（无人值守） |
 | `disableOn` | 旧键，为兼容保留。`"never"` 仍然有效（命中只挂提示、永不自动改 profile）；其它值都等同于默认 |
+| `profile` | 目标 profile 名（等价于 `config.profile`，改完不必重启 DSH） |
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DSH_HOME` | `~/.dsh` | DSH 主目录 |
-| `DSH_PROFILE` | `web` | 目标 profile |
+| `DSH_PROFILE` | 未设 → 按候选探测 | 目标 profile。**Desktop 客户端通常不设这个变量**，所以更推荐用 `config.profile`（见上） |
 | `WORKBUDDY_WATCH_PLATFORM` | 按平台猜 | 版本接口的 platform 标识（`workbuddy-darwin-x64`、`workbuddy-linux-x64-deb`、`workbuddy-win32-x64-user`） |
 | `WORKBUDDY_WATCH_UPSTREAM` | 官网 `/v2/update` | 覆盖版本接口（自建镜像、内网代理时用） |
 | `WORKBUDDY_WATCH_DISABLE_ON_UPSTREAM` | 未设 | 兼容旧配置；设为 `1` 仍表示「命中即算停用条件」 |
