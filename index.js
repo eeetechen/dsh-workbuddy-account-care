@@ -93,17 +93,13 @@ const WATCH_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'scripts', 'w
 /**
  * 自带定时的默认间隔，分钟。
  *
- * 这是**三段延迟里最大的一段**：脚本每一轮才探一次五个平台的版本接口，
- * 所以「WB 发了新版」到「水印出现」的最坏等待就等于这个间隔。
+ * 这是「WB 发了新版」到「脚本发现」的最坏等待。保持 3 分钟：这是**后台检查**，
+ * 用户对这段等待无感——他真正会抱怨的是「水印为什么还不出来」，
+ * 而那段延迟主要由 host 轮询与浏览器轮询决定（都已收紧到秒级）。
  *
- * 从 3 分钟降到 1 分钟：用户实际感知从「最多 3.75 分钟」降到「最多 1.5 分钟」。
- * 代价是每小时多跑两轮：每轮 5 个 HTTP 请求 + 一个 Node 子进程（实测 2.8 秒）。
- * 这些接口是官方更新检查接口，请求量级和客户端自己检查一次更新相当，
- * 一分钟一次不算异常流量。
- *
- * 想更激进就配 `intervalMinutes`（插件 Config 已暴露），想省流量就配大。
+ * 想更快就配 `intervalMinutes`（插件 Config 已暴露），想省流量就配大。
  */
-const DEFAULT_INTERVAL_MINUTES = 1
+const DEFAULT_INTERVAL_MINUTES = 3
 
 /**
  * 插件加载后到第一次检查之间的默认延迟，毫秒。
@@ -688,9 +684,30 @@ export function apply(ctx, config = {}) {
 
     const disabled = await disableCurrentBundle()
     if (!disabled.ok) logger.error?.(`[workbuddy-guard] 停用失败: ${disabled.error ?? disabled.stderr ?? disabled.code}`)
-    await finalizeWatermark(state.file, action)
-    logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：disabled=${disabled.ok}`)
-    return { stopped, idle, disabled }
+
+    /**
+     * **只有真的停用了才把水印改成「已处理」。**
+     *
+     * 早先这里无条件调用 `finalizeWatermark`，于是停用失败时也把
+     * `pendingDisable` 改成 false、清掉 actions——用户看到卡片从「等你选」变成
+     * 一条没有按钮的静态提示，还以为是处理完了，实际上 bundle 仍在 bundles 里、
+     * provider 仍然可用。这就是「水印消失了、但 WB provider 没被禁用」的成因。
+     *
+     * 现在的语义：
+     *   - 停用成功 → 水印转为「已处理」（不带按钮，跟随 provider 选择显示）
+     *   - 停用失败 → 水印**原样保留**（仍是 pendingDisable、按钮还在），
+     *     用户可以再点一次；失败原因写进日志，界面也会显示「操作失败」
+     */
+    const disabledOk = disabled.ok
+      && (disabled.result?.changed === true || disabled.result?.result?.changed === true)
+    if (disabledOk) {
+      await finalizeWatermark(state.file, action)
+      logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：bundle 已停用`)
+    } else {
+      const detail = disabled.error ?? disabled.stderr ?? (disabled.result?.result?.reason ?? 'unknown')
+      logger.error?.(`[workbuddy-guard] 动作 ${action}：bundle **未**停用（${detail}），水印保持待确认`)
+    }
+    return { stopped, idle, disabled, disabledOk }
   }
 
   async function handleAction(req, res) {

@@ -1079,42 +1079,34 @@ async function main() {
   const platformResults = []
 
   /**
-   * **五个平台并行探，不要串行 await。**
+   * **五个平台串行探。**
    *
-   * 原来这里是 `for (… of probes) { const iface = await readPlatform(…) }`，
-   * 五个 HTTP 请求一个接一个发：单轮实测 2.8 秒，其中九成时间在等网络。
-   * 串行没有任何好处——五个平台互不依赖，结果最后才一起参与判定。
+   * 试过 `Promise.all` 并行：单轮从 2.8 秒降到 0.6～1.1 秒，但这是**后台检查**，
+   * 用户完全无感——省这一两秒换不来任何可观察的改善，却要在同一瞬间向官方
+   * 接口发五个请求。串行更稳、更像一个正常客户端的行为（客户端的更新检查
+   * 本来也不是并发轰炸），也便于日志按平台顺序读。
    *
-   * 并发之后单轮降到接近最慢那一个请求的耗时（通常 0.5～1 秒）。
-   * 顺序仍然保留：`platformResults` 按 `probes` 的原顺序填，`judgedFrom`
-   * 依赖这个顺序输出「谁把版本抬到了判定值」。
-   *
-   * 失败隔离：`readPlatform` 内部把网络错误转成 `{ok:false,error}`，
-   * 不会 reject，所以单个平台挂掉不影响其它四个。
+   * 真正影响用户的是三段轮询的间隔（见 index.js / client.js 的 POLL_MS），
+   * 不是这一轮内部快多少。
    */
-  const fetched = await Promise.all(probes.map((probe) => {
-    if (simulated) {
-      return {
+  for (const probe of probes) {
+    const platformId = probe.id
+    const iface = simulated
+      ? {
         ok: true,
-        platformId: probe.id,
+        platformId,
         version: SIMULATE_VERSION,
         // 演练不联网，但要造一个形状真实的链接，好让文件名解析那一路也真的跑一遍
         // 换链接只对本机那一路生效，否则三个判定平台都会拿到同一个文件名，
         // 模拟出来的「各平台自洽」就是假的（真链路里每个平台取自己响应里的 url）。
-        url: (SIMULATE_URL !== null && probe.id === PLATFORM_ID)
+        url: (SIMULATE_URL !== null && platformId === PLATFORM_ID)
           ? SIMULATE_URL
-          : `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(probe.id)}/`
-            + `WorkBuddy-${expectedFilenamePlatform(probe.id)}-${SIMULATE_VERSION}-d4692421.zip`,
+          : `https://download.codebuddy.cn/workbuddy/saas/${expectedFilenamePlatform(platformId)}/`
+            + `WorkBuddy-${expectedFilenamePlatform(platformId)}-${SIMULATE_VERSION}-d4692421.zip`,
         publishedAt: null,
         simulated: true,
       }
-    }
-    return readPlatform(probe.id, probe.url ?? upstreamUrlFor(probe.id))
-  }))
-
-  for (const [index, probe] of probes.entries()) {
-    const platformId = probe.id
-    const iface = fetched[index]
+      : await readPlatform(platformId, probe.url ?? upstreamUrlFor(platformId))
     // 演练「换链接」：只替换本机那一路，其它平台保持自洽
     if (!simulated && SIMULATE_URL !== null && platformId === PLATFORM_ID) {
       iface.url = SIMULATE_URL

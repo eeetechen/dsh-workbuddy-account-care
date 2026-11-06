@@ -344,17 +344,27 @@ window.__ModuleLoader__.load({
       const watermark = state?.watermark ?? null
       const revision = state?.revision ?? null
       const usage = useWorkbuddyUsage(sessions)
-      /** 这条是「等你决定」的提示（带软结束/硬结束按钮）。 */
-      const pending = watermark?.pendingDisable === true
       /**
-       * 两个阶段的门控不一样，这是产品约定的核心：
+       * 显示门控：**只要当前会话选中了 workbuddy，就该提示**——无论有没有
+       * 会话在真正跑。
        *
-       *   - **待确认**（插件还开着，等你选软结束/硬结束）：
-       *     只在「有 workbuddy 会话正在跑」时显示——没在跑就不打扰。
-       *   - **已处理**（插件已关，或你后来强开了它）：
-       *     跟随 provider 选择——当前会话选中 workbuddy 就出现，切走就消失。
+       * 早先这里写成 `pending ? usage.running : (usage.running || usage.selected)`，
+       * 于是「待确认」阶段只认 `running`：用户在新会话里把 provider 切成
+       * workbuddy、但还没发消息时，水印不出现；直到他发出第一条消息、会话
+       * 进入运行态才浮现。用户看到的就是「水印没跟随选择，要发一条消息才出来」
+       * ——那正是他选择它的**那一刻**最该被提醒，晚一步就来不及了。
+       *
+       * 「没在跑就不打扰」的初衷可以理解，但真正制造打扰的是「没在用 WorkBuddy
+       * 的人被弹窗」，而 `selected` 恰恰证明他正在用。所以两个阶段统一：
+       *
+       *   选中 workbuddy（当前会话）  → 显示
+       *   有 workbuddy 会话在跑      → 显示
+       *   两者都没有                → 不显示
+       *
+       * 注意 `usage.selected` 看的是 `mainView` 那个会话的 provider 投影，
+       * 是**切换那一刻**就变了的值，不需要等消息。
        */
-      const gateOpen = pending ? usage.running : (usage.running || usage.selected)
+      const gateOpen = usage.running || usage.selected
 
       /** 被「知道了」暂时收起的那个 revision；null = 没被收起。 */
       const [snoozedRevision, setSnoozedRevision] = React.useState(null)
@@ -458,6 +468,20 @@ window.__ModuleLoader__.load({
           })
           const payload = await res.json().catch(() => ({}))
           if (!res.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${res.status}`)
+          /**
+           * Host 明确回报「没停用成功」时，**不能**把它当成处理完。
+           *
+           * 旧版这里只看 HTTP 状态；而 Host 曾无条件把水印改成已处理，于是
+           * 停用失败也返回 200，界面收起卡片、用户以为好了，实际 provider 还在。
+           * Host 现在会带 `disabledOk`，这里据此判断。
+           */
+          if (payload.disabledOk === false) {
+            const detail = payload.disabled?.error
+              ?? payload.disabled?.stderr
+              ?? payload.disabled?.result?.result?.reason
+              ?? 'bundle 未能停用'
+            throw new Error(detail)
+          }
           setFinishedRevision(revision)
         } catch (error) {
           setFailed(String(error?.message ?? error))
