@@ -708,93 +708,49 @@ async function readPluginLatest() {
 }
 
 /**
- * 用 dsh CLI 升级插件。
+ * 升级插件。
  *
- * 走 `dsh plugin --profile <p> add <pkg>@<ver>` 而不是自己跑 pnpm：这条命令就是
- * profile 的包管理器入口，它在装完之后会做 reconcile（把新 bundle 补回
- * dsh.profile.bundles），手写 pnpm 会漏掉那一步。
+ * 这里**只负责判定「该升到哪一版」并下发指令**，不自己执行安装。
+ * 执行交给插件本体（`index.js`，跑在宿主进程里），它按环境挑一条路：
+ * 宿主 `pluginManager.installBundle` / `dsh` CLI / 都不可用则只报告。
+ * 三条路的取舍见 `index.js` 的 `resolveUpgrader`。
+ *
+ * 之所以不再在本脚本里 spawn `dsh`：这个脚本是 `node` 派生的独立进程，
+ * 在 DSH Desktop（Electron）里 `dsh` 不在 PATH 上，只有一个 `dsh.cmd`，
+ * 而 Node 修 CVE-2024-27980 之后拒绝在不带 shell 时 spawn `.cmd`——
+ * 所以那条路在桌面端 100% 失败。桌面端的插件管理能力在宿主进程里，不在
+ * 这个子进程里。
  *
  * **不动 bundles 列表**：升级不等于启用。如果它已经被停用，升级完仍然是停用，
  * 否则「升级」会顺手把刚刚停用的东西又打开。
- *
- * 两个已知的 pnpm 环境陷阱，都重试一次：
- *   - ERR_PNPM_UNEXPECTED_STORE：node_modules 与当前 pnpm 认定的 store 不在
- *     一起（把 profile 搬过机器、或 DSH_HOME 换了位置）。这时按 profile 里
- *     记录的 store 重指一次。
- *   - 安装成功后版本号没变：minimumReleaseAge / 缓存导致的滞后，重读一次。
  */
-/**
- * profile 的 node_modules 实际链接自哪个 pnpm store。
- *
- * pnpm 把这件事记在 `node_modules/.modules.yaml` 的 `storeDir`。升级时读到它
- * 就能避免 `ERR_PNPM_UNEXPECTED_STORE` —— 那个错误来自「pnpm 现在认定的 store
- * 与 node_modules 的来源不一致」，而 pnpm 自己写下的事实比它重新推断的更可靠。
- */
-function detectPnpmStore() {
-  const file = join(PROFILE_DIR(), 'node_modules', '.modules.yaml')
-  try {
-    // 该文件是「带引号的 JSON 风格 YAML」，行形如：
-    //   "storeDir": "/home/eaton/.local/share/pnpm/store/v10",
-    // 不要给正则加行尾锚点：结尾还有引号与逗号。
-    const text = readFileSync(file, 'utf8')
-    const line = text.split('\n').find((l) => l.includes('storeDir'))
-    if (!line) return null
-    const m = line.match(/"?storeDir"?\s*:\s*"?([^",\r\n]+)/)
-    return m ? m[1].trim() : null
-  } catch { return null }
-}
-
 function upgradePlugin(targetVersion, { dryRun }) {
   const spec = `${BUNDLE}@${targetVersion}`
   const command = `dsh plugin --profile ${PROFILE()} add ${spec}`
+  // 演练模式只报告「会下发什么」，不碰 guard.json。
+  // `command` 保留在这里是为了让 --dry-run 的输出对得上「命令行等价物」，
+  // 真正执行时并不用它（见下方：执行在宿主进程里，且可能不走 CLI）。
   if (dryRun) return { upgraded: false, wouldUpgrade: true, spec, command }
 
-  const run = () => execFileSync('dsh', ['plugin', '--profile', PROFILE(), 'add', spec], {
-    encoding: 'utf8', timeout: 300_000, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DSH_HOME },
-  })
-
-  let lastError = null
-  let storePin = null
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const out = run()
-      const after = readInstalledPlugin()
-      if (after.version === targetVersion) {
-        log('warn', `插件升级 ${spec} → 已安装 ${after.version}`)
-        return { upgraded: true, spec, installed: after.version, command, storePin, output: out.slice(-2000) }
-      }
-      lastError = `命令成功但版本仍是 ${after.version ?? '未知'}`
-      log('warn', `插件升级：${lastError}`)
-      break
-    } catch (error) {
-      lastError = String(error?.message || error)
-      const logPath = String(error?.stderr || '').match(/diagnostics: (\S+)/)?.[1]
-      let detail = ''
-      try { detail = logPath ? readFileSync(logPath, 'utf8') : '' } catch { /* 没日志 */ }
-      const storeIssue = /ERR_PNPM_UNEXPECTED_STORE/.test(detail)
-      log('warn', `插件升级第 ${attempt} 次失败${storeIssue ? '（pnpm store 错配）' : ''}: ${lastError}`)
-      if (!storeIssue || attempt === 2) break
-      // 把 pnpm 自己记录的 store 写进 profile 的 .npmrc，再试一次
-      storePin = detectPnpmStore()
-      if (storePin === null) {
-        log('warn', '读不到 .modules.yaml 的 storeDir，无法自动修复 store 错配')
-        break
-      }
-      try {
-        const npmrc = join(PROFILE_DIR(), '.npmrc')
-        const existing = existsSync(npmrc) ? readFileSync(npmrc, 'utf8') : ''
-        if (!/^store-dir=/m.test(existing)) {
-          writeFileSync(npmrc, `${existing}${existing && !existing.endsWith('\n') ? '\n' : ''}store-dir=${storePin}\n`, { mode: 0o600 })
-          log('warn', `已把 store-dir=${storePin} 写入 profile 的 .npmrc，重试`)
-        }
-      } catch (writeError) {
-        log('warn', `写 .npmrc 失败: ${String(writeError?.message || writeError)}`)
-        break
-      }
-    }
-  }
-  return { upgraded: false, spec, command, storePin, error: lastError }
+  // ---- 本脚本不再自己跑升级 ------------------------------------------------
+  //
+  // 早先这里是 `execFileSync('dsh', ['plugin', …])`，在 DSH Desktop（Electron）
+  // 上必然失败：宿主进程的 PATH 里没有 `dsh`，它只是安装目录下的 `dsh.cmd`。
+  // 而 Node 从 18.20/20.12/21.7 起修 CVE-2024-27980，**拒绝**在不带 shell 时
+  // spawn `.cmd`/`.bat`：
+  //   execFileSync('dsh', …)          → ENOENT（PATHEXT 不参与解析）
+  //   execFileSync('…\\dsh.cmd', …)   → EINVAL（防注入保护）
+  // 加 shell 能跑通，但那是「绕过宿主」的做法——Desktop 本来就有自己的插件
+  // 管理服务。所以把「要升级到哪个版本」写进 guard.json，由插件本体
+  // （index.js，跑在宿主进程里）按环境挑路执行（见 index.js 的 resolveUpgrader）：
+  //   1. 宿主 `pluginManager.updateBundle` / `installBundle`
+  //   2. `dsh` CLI（仅命令行的 Harness）
+  //   3. 都没有 → 只记录、不改动
+  //
+  // 写入是幂等的：同一 from→to 重复写，revision 不变（见 issueUpgrade）。
+  const request = issueUpgrade(targetVersion, { from: readInstalledPlugin().version, spec })
+  log('info', `已下发插件升级指令 → ${spec}（revision ${request.revision}，由宿主执行）`)
+  return { upgraded: false, pending: true, spec, revision: request.revision, reused: request.reused === true }
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +758,71 @@ function upgradePlugin(targetVersion, { dryRun }) {
 // ---------------------------------------------------------------------------
 
 function readGuardFile() {
-  return readJson(GUARD_FILE, { schema: 1, revision: 0, watermark: null, stopSessions: null })
+  return readJson(GUARD_FILE, { schema: 1, revision: 0, watermark: null, stopSessions: null, upgrade: null })
+}
+
+/**
+ * 下发「把插件升级到 <version>」的指令，交给宿主进程执行。
+ *
+ * **为什么要去重**：脚本每 3 分钟跑一轮。宿主可能还没执行（进程刚起、
+ * 上一轮还在装），没有去重就会把 revision 越推越高，宿主每次升级都以为是
+ * 新指令，于是并发装同一个包。所以同一个 `from → to` 只下发一次，
+ * 除非上一次已经明确 `done` 或 `failed`。
+ *
+ * **为什么要限次**：装包可能持续性失败（网络、权限、registry 不可达）。
+ * 失败后若无条件重发，就会变成每 3 分钟一次的无限重试，日志被刷满、
+ * 还把 profile 的 pnpm 锁反复占住。这里给 2 次上限，用尽后只记录、
+ * 不再下发 —— 由用户手动处理。
+ */
+const UPGRADE_MAX_ATTEMPTS = 2
+
+function issueUpgrade(to, { from, spec }) {
+  const previous = readGuardFile()
+  const existing = previous.upgrade
+
+  if (existing && existing.to === to && existing.from === from) {
+    if (existing.status === 'done') {
+      return { revision: Number(existing.revision) || 0, reused: true, request: existing }
+    }
+    if (existing.status === 'pending' && existing.transient !== true) {
+      // 宿主还没跑过：等它，别插队。
+      return { revision: Number(existing.revision) || 0, reused: true, request: existing }
+    }
+    // 走到这里有两种：
+    //   · status === 'failed'  —— 真失败，消耗额度重试；
+    //   · status === 'pending' 且 transient === true —— 瞬时失败（HMR 事务
+    //     嵌套），不消耗额度，直接重排一次。
+    const attempts = Number(existing.attempts) || 1
+    const transient = existing.transient === true
+    if (!transient && attempts >= UPGRADE_MAX_ATTEMPTS) {
+      log('warn', `升级已失败 ${attempts} 次，不再重试：${existing.error ?? '（无错误信息）'}`)
+      return { revision: Number(existing.revision) || 0, reused: true, exhausted: true, request: existing }
+    }
+    const revision = (Number(previous.revision) || 0) + 1
+    const request = {
+      revision, from, to, spec,
+      status: 'pending',
+      attempts: transient ? attempts : attempts + 1,
+      previousError: existing.error ?? null,
+      issuedAt: nowIso(),
+    }
+    writeJsonAtomic(GUARD_FILE, { ...previous, schema: 1, revision, upgrade: request })
+    return { revision, reused: false, request }
+  }
+
+  const revision = (Number(previous.revision) || 0) + 1
+  const request = {
+    revision,
+    from,
+    to,
+    spec,
+    status: 'pending',
+    attempts: 1,
+    issuedAt: nowIso(),
+  }
+  const next = { ...previous, schema: 1, revision, upgrade: request }
+  writeJsonAtomic(GUARD_FILE, next)
+  return { revision, reused: false, request }
 }
 
 /**
@@ -961,6 +981,14 @@ async function main() {
       pluginSeen: state.pluginSeen?.version ?? null,
       watermark: guard.watermark ? { title: guard.watermark.title, body: guard.watermark.body, at: guard.watermark.at } : null,
       pendingStop: guard.stopSessions && !guard.stopSessions.handled ? guard.stopSessions.revision : null,
+      /**
+       * 插件升级指令的当前状态。`status` 由宿主回写：
+       *   pending —— 已下发，宿主还没执行；
+       *   done    —— 装成功（`method` 说明走的是哪条路）；
+       *   failed  —— 装失败，看 `error`；累计 2 次后脚本不再重试。
+       * `method` 取值：host-service（宿主 pluginManager）/ dsh-cli / none。
+       */
+      upgrade: guard.upgrade ?? null,
       disabled: state.disabled ?? null,
       pendingReport: (state.pendingReport ?? []).length,
       checks: state.checks ?? 0,
@@ -1243,6 +1271,9 @@ async function main() {
       if (!MODE_CHECK) {
         pluginUpgrade = upgradePlugin(pluginLatest.version, { dryRun: DRY_RUN })
         if (pluginUpgrade.upgraded) {
+          // CLI 同步升级成功（非桌面平台的老路径）。桌面端走不到这里：
+          // 那边由宿主执行，成功与否要到下一轮从磁盘上的版本号看出来。
+          //
           // 升级后**不**自动启用：升级不等于启用。已经停用的仍然是停用的。
           //
           // `untilRestart: true` 是这条水印的全部要点：它提示的「重启 DSH 生效」
@@ -1258,6 +1289,8 @@ async function main() {
           })
           log('warn', `插件已升级到 ${pluginLatest.version}，水印 revision ${revision}（重启后自动清除）`)
         }
+        // `pending: true`：指令已交给宿主，本轮不做任何「已完成」的断言。
+        // 水印也留到宿主回报结果之后再挂（它可能还要重启，见 index.js）。
       }
     } else if (cmp < 0) {
       log('info', `已安装插件 ${installedVersion} 比 npm latest ${pluginLatest.version} 更新（预发布/本地版），忽略`)
@@ -1377,6 +1410,17 @@ async function main() {
         version: pluginLatest.version,
         firstSeenAt: state.pluginSeen?.firstSeenAt ?? nowIso(),
         updatedAt: nowIso(),
+      }
+    }
+    if (pluginUpgrade?.pending) {
+      // 指令已下发，执行在宿主进程。这里只记「已请求」，成功与否由宿主回写。
+      state.pluginUpgradeRequest = {
+        at: nowIso(),
+        from: installedVersion,
+        to: pluginLatest.version,
+        spec: pluginUpgrade.spec,
+        revision: pluginUpgrade.revision ?? null,
+        status: 'requested',
       }
     }
     if (pluginUpgrade?.upgraded) {

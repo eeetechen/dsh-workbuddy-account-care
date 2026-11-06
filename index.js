@@ -61,6 +61,7 @@
  * 比较 `watermark.at` 与本进程的启动时刻，早于启动时刻就把它清成 null。
  */
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -151,6 +152,124 @@ function guardFile() {
     || join(resolveDshHome(), 'workbuddy-update-watch', 'guard.json')
 }
 
+/**
+ * 在 **HMR 事务之外** 执行一段异步代码。
+ *
+ * 为什么需要：`@deepseek-ai/dsh-hmr` 的 `runExclusive()` 这样判断嵌套：
+ *
+ *     runExclusive(operation) {
+ *       if (this.executing.getStore()) return Promise.reject(new Error('HMR transactions cannot be nested'))
+ *       const task = this.operations.then(async () => {
+ *         return this.executing.run(true, operation)
+ *       })
+ *       ...
+ *     }
+ *
+ * 而 `pluginManager` 的每个写操作都经 `configure()` → `hmr.runExclusive()`，
+ * 包括 `updateBundle()` 内部的 remove + install 两步。
+ *
+ * `this.executing` 是 `AsyncLocalStorage`。ALS 上下文会跟着**异步链**传播，
+ * 连 `setTimeout` / `setImmediate` 都会继承。所以只要本插件的 `poll()` 是从
+ * 某个 HMR 事务（最典型的是「刚装完本插件」那次 reconcile）里排期出来的，
+ * 之后再怎么延后调用，`getStore()` 都还在——实测把首轮 poll 改成 setTimeout 0
+ * 依然报同样的错。
+ *
+ * 解法只有一个：**显式退出**那个 ALS。`AsyncLocalStorage.exit(fn)` 会把 fn
+ * 放在没有 store 的上下文里执行，此后整条链都干净了。
+ *
+ * `executing` 没出现在 hmr 的 Service 声明里（属于实现细节），所以这里全部
+ * 做能力探测：拿不到就照常执行——没有 hmr 的 profile（如精简的 `dsh web`）
+ * 本来就没有事务这一层，直接跑正是正确行为。
+ */
+async function runOutsideHmr(ctx, operation) {
+  let hmr
+  try {
+    hmr = typeof ctx.get === 'function' ? ctx.get('hmr') : undefined
+  } catch { hmr = undefined }
+
+  // `executing` 是 dsh-hmr 的私有 AsyncLocalStorage（Service 声明里没公开，
+  // 但实例上确实存在）。拿得到就精确退出；拿不到就照常执行——
+  // 没有 hmr 的 profile 本来就没有事务这一层。
+  const store = hmr?.executing
+  if (typeof store?.exit === 'function' && typeof store.getStore === 'function') {
+    return store.getStore() !== undefined
+      ? await store.exit(() => operation())
+      : await operation()
+  }
+  return await operation()
+}
+
+/**
+ * 这个升级错误是不是**瞬时**的（等一会儿再试就能成）。
+ *
+ * 目前已知一种：`HMR transactions cannot be nested`。
+ *
+ * 成因在 `pluginManager.configure()`：
+ *
+ *     configure(operation) {
+ *       const hmr = this.ownerContext.get("hmr")
+ *       return hmr === void 0 ? operation() : hmr.runExclusive(operation)
+ *     }
+ *
+ * `updateBundle` 内部（HMR 下）会先 `removeBundle` 再 `installBundle`，
+ * 两者都走 `configure()` → `hmr.runExclusive()`。如果这次升级恰好发生在
+ * **另一个 HMR 事务还没结束**的时候（最典型的就是本插件刚被安装 / 刚重新
+ * reconcile，`apply()` 里的首轮 poll 就同步跑了起来），就会撞上嵌套限制。
+ *
+ * 这类失败不是「升级本身有问题」，所以**不该消耗重试次数**——否则两次偶然
+ * 的时序冲突就会把自动升级判死。交给下一轮（15 秒 / 3 分钟）重试即可。
+ */
+function isTransientUpgradeError(value) {
+  const text = String(value?.message ?? value?.error?.diagnostic ?? value?.error?.code ?? value ?? '')
+  return /HMR transactions cannot be nested/i.test(text)
+}
+
+/**
+ * `ChangeResult` 的失败原因拼成人能读的一行。
+ *
+ * `error.code` 是枚举（`incompatible-version` 之类），`diagnostic` 才是细节，
+ * 两者都要留 —— 只报 code 看不出为什么，只报 diagnostic 又丢了分类。
+ */
+function describeFailure(result) {
+  if (result?.error?.code) {
+    return `${result.error.code}${result.error.diagnostic ? `: ${result.error.diagnostic}` : ''}`
+  }
+  return String(result?.application ?? 'unknown')
+}
+
+/**
+ * 把 `name@version` 拆开。取**最后一个** `@`，因为 scope 包形如
+ * `@scope/name@1.2.3`，第一个 `@` 是 scope 前缀。
+ *
+ * 拆不出来（没有版本、是 tarball/路径/git spec）就返回 null，
+ * 调用方据此跳过 `updateBundle` 直接 `installBundle`。
+ */
+function splitSpec(spec) {
+  const text = String(spec ?? '').trim()
+  const at = text.lastIndexOf('@')
+  if (at <= 0) return { name: null, version: null }
+  const name = text.slice(0, at)
+  const version = text.slice(at + 1)
+  if (name === '' || version === '' || /[/\\:]/.test(version)) return { name: null, version: null }
+  return { name, version }
+}
+
+/**
+ * 当前 profile 名。CLI 升级路径要用它（`dsh plugin --profile <p> add`）。
+ *
+ * Desktop 的宿主进程**不导出 `DSH_PROFILE`**，所以这里的兜底不是可选的：
+ * 读 `config.profile`（`apply` 里传进来的），再退到环境变量，最后用 `desktop`。
+ * 与 `scripts/watch.mjs` 的 `resolveProfile()` 是同一套优先级，只是插件本体
+ * 没有候选探测能力（它不该去扫别人的 profile 目录）。
+ */
+function profileName(config) {
+  const fromConfig = typeof config?.profile === 'string' ? config.profile.trim() : ''
+  if (fromConfig !== '') return fromConfig
+  const fromEnv = process.env.DSH_PROFILE?.trim()
+  if (fromEnv) return fromEnv
+  return 'desktop'
+}
+
 /** 读状态文件；不存在或读坏都当成「没有水印、没有指令」。 */
 async function readGuardState() {
   const file = guardFile()
@@ -165,9 +284,14 @@ async function readGuardState() {
       revision: Number.isFinite(parsed?.revision) ? parsed.revision : 0,
       watermark: parsed?.watermark ?? null,
       stopSessions: parsed?.stopSessions ?? null,
+      upgrade: parsed?.upgrade ?? null,
     }
   } catch (error) {
-    return { ok: false, file, mtimeMs: 0, revision: 0, watermark: null, stopSessions: null, error: String(error?.message || error) }
+    return {
+      ok: false, file, mtimeMs: 0, revision: 0,
+      watermark: null, stopSessions: null, upgrade: null,
+      error: String(error?.message || error),
+    }
   }
 }
 
@@ -243,6 +367,25 @@ async function markHandled(state, report) {
   try { current = JSON.parse(await readFile(state.file, 'utf8')) } catch { return }
   current.stopSessions = { ...(current.stopSessions ?? {}), handled: report }
   current.handledAt = new Date().toISOString()
+  const tmp = `${state.file}.tmp-${process.pid}`
+  await writeFile(tmp, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600 })
+  await rename(tmp, state.file)
+}
+
+/**
+ * 把升级指令的执行结果写回 `guard.json`。
+ *
+ * 只改 `upgrade` 这一个子对象：`revision` 的抬升交给脚本侧的下一次写入，
+ * 这里不碰，否则「脚本按 revision 判断要不要执行」会自我触发。
+ * `status` 从 `pending` 变成 `done`/`failed`，脚本据此不再重复下发。
+ */
+async function markUpgrade(state, report) {
+  if (!state.ok) return
+  let current
+  try { current = JSON.parse(await readFile(state.file, 'utf8')) } catch { return }
+  const previous = current.upgrade ?? {}
+  current.upgrade = { ...previous, ...report, requestedAt: previous.issuedAt ?? null }
+  current.upgradeAt = report?.at ?? new Date().toISOString()
   const tmp = `${state.file}.tmp-${process.pid}`
   await writeFile(tmp, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600 })
   await rename(tmp, state.file)
@@ -379,6 +522,10 @@ export const name = 'dsh-workbuddy-account-care'
  * `agents` 必须是声明的：软结束会话要遍历 `ctx.agents.list()`。漏掉它时
  * `ctx.agents` 在 Cordis 里是 undefined，整段软结束会抛异常并被轮询的
  * try/catch 吞掉 —— 表现就是「水印出来了、会话没停」。
+ *
+ * `pluginManager` **不在这里**：它是可选能力，用 `ctx.get('pluginManager')`
+ * 取（见 `resolveUpgrader`）。写进 `inject` 会让没有该服务的 profile
+ * 整个插件都加载不起来 —— 而水印与停用是核心功能，不该被升级能力拖累。
  */
 export const inject = ['webServer', 'agents']
 
@@ -388,6 +535,8 @@ export function apply(ctx, config = {}) {
 
   /** 已经处理过的指令 revision，避免同一指令重复执行。 */
   let handledStopRevision = 0
+  /** 已经执行过的升级指令 revision；防止同一个 pending 被反复执行。 */
+  let handledUpgradeRevision = 0
   /** 已经下发的水印 revision，避免每 15 秒重推同样的值。 */
   let publishedWatermarkRevision = -1
   /** 浏览器半要读的当前值。 */
@@ -642,6 +791,243 @@ export function apply(ctx, config = {}) {
     return { stopped, skipped }
   }
 
+  /**
+   * 把 `dsh-connect-workbuddy` 升到指定版本。三条路，按环境挑一条。
+   *
+   * 为什么不是一条：这个插件同时活在两种宿主里，而它们**没有共同的可执行入口**。
+   *
+   *   1. `host-service` —— DSH Desktop（Electron）或任何装了
+   *      `@deepseek-ai/dsh-plugin-manager` 的 profile。用 `ctx.get('pluginManager')`
+   *      调 `installBundle`。这是最正确的一条：与界面里点「更新」走同一条 pnpm
+   *      路径，装完会自动 reconcile `dsh.profile.bundles`，HMR 下还能热生效。
+   *      **不需要 `dsh` 在 PATH 上。**
+   *
+   *   2. `dsh-cli` —— 命令行启动的 Harness（`dsh web`），`dsh` 是真实可执行文件。
+   *      调 `dsh plugin --profile <p> add <spec>`。
+   *
+   *   3. 都没有 —— 只报告，不改动。把结论写进日志与 `--status`，让用户自己升。
+   *
+   * 早先只有第 2 条路，且写死 `execFileSync('dsh', …)`。在 Desktop 上它 100%
+   * 失败：宿主的 PATH 里没有 `dsh`，安装目录里只有 `dsh.cmd`，而 Node 修
+   * CVE-2024-27980 之后拒绝在不带 shell 时 spawn `.cmd`（ENOENT/EINVAL）。
+   * 于是每轮只留下一条 `spawnSync dsh ENOENT` 的 warn。
+   *
+   * 顺序是「先问宿主，再问 PATH」：宿主存在就说明这个进程自己有插件管理能力，
+   * 比自己 fork 一个 CLI 更可靠，也不依赖用户的 PATH 配置。
+   */
+  function resolveUpgrader() {
+    // 1) 宿主服务
+    let manager = null
+    try {
+      manager = typeof ctx.get === 'function' ? ctx.get('pluginManager') : undefined
+    } catch { manager = undefined }
+    if (manager && typeof manager.updateBundle === 'function') {
+      return {
+        kind: 'host-service',
+        label: '宿主 pluginManager.updateBundle',
+        async run(spec) {
+          const { name, version } = splitSpec(spec)
+          if (name === null || version === null) {
+            return { ok: false, method: 'host-service', error: `无法从 ${spec} 解析出包名与版本` }
+          }
+
+          /**
+           * 宿主侧**只有** `updateBundle` 这一条路，没有降级。
+           *
+           * `installBundle` 看着像备选，实际不行：源码里那行判断是
+           *
+           *   if (hmr 存在 && 包名已在 dependencies 里) throw already-installed
+           *
+           * ——与版本号无关。只要包已经装了（升级场景必然已装），有 HMR 时
+           * `installBundle` 一律拒绝。实测返回的就是 `already-installed`。
+           * 所以不要再把它当 fallback，那只会掩盖真正的原因。
+           */
+          try {
+            const updated = await manager.updateBundle(name, version)
+            // PluginUpdateResult: { from, to, step, result: ChangeResult, restore? }
+            const result = updated?.result ?? updated
+            const ok = result?.application === 'applied' || result?.application === 'restart-required'
+            const rolledBack = updated?.restore !== undefined && updated?.restore !== null
+            if (ok && !rolledBack) {
+              return {
+                ok: true,
+                method: 'host-service/updateBundle',
+                application: result?.application ?? null,
+                version: result?.version ?? null,
+                restart: result?.application === 'restart-required',
+                error: null,
+              }
+            }
+            return {
+              ok: false,
+              method: 'host-service/updateBundle',
+              application: result?.application ?? null,
+              step: updated?.step ?? null,
+              transient: isTransientUpgradeError(result),
+              error: `${describeFailure(result)}${rolledBack ? '（已回滚）' : ''}`,
+            }
+          } catch (error) {
+            const message = String(error?.message || error)
+            return {
+              ok: false,
+              method: 'host-service/updateBundle',
+              transient: isTransientUpgradeError(error),
+              error: message,
+            }
+          }
+        },
+      }
+    }
+
+    // 2) 命令行
+    const cli = findDshCli()
+    if (cli !== null) {
+      return {
+        kind: 'dsh-cli',
+        label: `CLI ${cli.command}`,
+        async run(spec) {
+          const args = ['plugin', '--profile', profileName(config), 'add', spec]
+          const out = await spawnCapture(cli.command, [...cli.prefix, ...args])
+          if (out.ok) return { ok: true, method: 'dsh-cli', output: out.stdout.slice(-2000) }
+          return { ok: false, method: 'dsh-cli', error: out.error }
+        },
+      }
+    }
+
+    // 3) 都不行
+    return {
+      kind: 'none',
+      label: '（不可用）',
+      async run() {
+        return {
+          ok: false,
+          method: 'none',
+          error: '既没有 pluginManager 服务，也找不到 dsh 命令；请手动升级',
+        }
+      },
+    }
+  }
+
+  /**
+   * 找 `dsh` 可执行文件。找不到返回 null。
+   *
+   * Windows 上不能直接 spawn `dsh.cmd`（CVE-2024-27980 之后 Node 拒绝），
+   * 所以这里**只认 .exe**，或者确认能通过 `cmd.exe /c` 调用。返回的
+   * `prefix` 就是给 `spawnCapture` 用的前置参数。
+   */
+  function findDshCli() {
+    const isWin = process.platform === 'win32'
+    const exts = isWin
+      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+      : ['']
+    const dirs = (process.env.PATH ?? '').split(isWin ? ';' : ':').filter(Boolean)
+    for (const dir of dirs) {
+      for (const ext of exts) {
+        const candidate = join(dir, `dsh${ext.toLowerCase()}`)
+        try {
+          if (existsSync(candidate)) {
+            // .cmd/.bat 必须经 cmd.exe
+            if (isWin && /\.(cmd|bat)$/i.test(candidate)) {
+              return { command: process.env.COMSPEC || 'cmd.exe', prefix: ['/c', candidate] }
+            }
+            return { command: candidate, prefix: [] }
+          }
+        } catch { /* 读不到就跳过 */ }
+      }
+    }
+    return null
+  }
+
+  /** 跑一个子进程并收齐输出；不抛异常。 */
+  function spawnCapture(command, args, timeoutMs = 300_000) {
+    return new Promise((resolve) => {
+      let child
+      try {
+        child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      } catch (error) {
+        resolve({ ok: false, error: String(error?.message || error) })
+        return
+      }
+      let stdout = ''
+      let stderr = ''
+      let settled = false
+      const finish = (value) => { if (!settled) { settled = true; resolve(value) } }
+      child.stdout?.on('data', (c) => { stdout += String(c) })
+      child.stderr?.on('data', (c) => { stderr += String(c) })
+      const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* 已退出 */ } }, timeoutMs)
+      timer.unref?.()
+      child.on('error', (error) => { clearTimeout(timer); finish({ ok: false, error: String(error?.message || error) }) })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        finish({
+          ok: code === 0,
+          code,
+          stdout,
+          stderr,
+          error: code === 0 ? null : `退出码 ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 500)}` : ''}`,
+        })
+      })
+    })
+  }
+
+  /** 执行一条升级指令，把结果写回 guard.json 供下一轮与 `--status` 读取。 */
+  async function runUpgrade(state, request) {
+    const spec = String(request.spec ?? `${GUARDED_BUNDLE}@${request.to}`)
+    const upgrader = resolveUpgrader()
+    logger.warn?.(`[workbuddy-guard] 开始升级 ${spec}（方式：${upgrader.label}）`)
+    let outcome
+    try {
+      outcome = await runOutsideHmr(ctx, () => upgrader.run(spec))
+    } catch (error) {
+      outcome = { ok: false, method: upgrader.kind, error: String(error?.message || error) }
+    }
+    await markUpgrade(state, {
+      revision: Number(request.revision) || 0,
+      // 瞬时失败（HMR 事务嵌套）写 `pending` 而不是 `failed`：
+      // 脚本据此不消耗重试次数，下一轮还会再试。
+      status: outcome.ok ? 'done' : (outcome.transient === true ? 'pending' : 'failed'),
+      transient: outcome.transient === true ? true : undefined,
+      method: outcome.method ?? upgrader.kind,
+      at: new Date().toISOString(),
+      application: outcome.application ?? null,
+      restart: outcome.restart === true,
+      ...(outcome.error ? { error: outcome.error } : {}),
+    })
+    if (outcome.ok) {
+      logger.warn?.(`[workbuddy-guard] 升级完成：${spec}（${outcome.method}${outcome.restart ? '，需重启生效' : ''}）`)
+      // 升级不等于启用；且只有「需要重启」时才挂一次性水印。
+      if (outcome.restart === true) {
+        await pushRestartWatermark(request.from, request.to)
+      }
+    } else if (outcome.transient === true) {
+      logger.warn?.(`[workbuddy-guard] 升级暂时做不了（${outcome.error}），下一轮再试`)
+    } else {
+      logger.error?.(`[workbuddy-guard] 升级失败（${outcome.method}）：${outcome.error}`)
+    }
+    return outcome
+  }
+
+  /** 升级后的「重启生效」水印；与脚本写的那条同构，重启后自动过期。 */
+  async function pushRestartWatermark(from, to) {
+    const file = guardFile()
+    let snapshot
+    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
+    snapshot.watermark = {
+      level: 'warning',
+      title: '插件已升级',
+      body: '重启 DSH 生效。',
+      detail: `${GUARDED_BUNDLE} ${from ?? '?'} → ${to ?? '?'}`,
+      untilRestart: true,
+      at: new Date().toISOString(),
+    }
+    snapshot.revision = (Number(snapshot.revision) || 0) + 1
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+    await rename(tmp, file)
+    publishedWatermarkRevision = snapshot.revision
+    current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
+  }
+
   /** 读一次状态文件，按 revision 执行应该执行的动作。 */
   async function poll() {
     // 0) 上一次进程留下的「重启生效」水印，在首次发布之前就清掉
@@ -651,6 +1037,13 @@ export function apply(ctx, config = {}) {
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
       current = { watermark: state.watermark, revision: state.revision, guardFile: state.file }
+    }
+
+    // 1.5) 插件升级指令（脚本只负责「想升到哪」，执行在宿主进程里）
+    const upgrade = state.upgrade
+    if (upgrade && upgrade.status === 'pending' && Number(upgrade.revision) > handledUpgradeRevision) {
+      handledUpgradeRevision = Number(upgrade.revision)
+      await runUpgrade(state, upgrade)
     }
 
     // 2) 软结束会话：指令里带 stopSessions 就执行一次（幂等）
@@ -866,9 +1259,22 @@ export function apply(ctx, config = {}) {
       if (alive) timer = setTimeout(tick, pollMs)
       timer?.unref?.()
     }
-    void tick()
+    /**
+     * 首轮**不能**在 `apply()` 里同步跑。
+     *
+     * `apply()` 执行时，Cordis 可能正处在一个 HMR 事务里（本插件刚被安装、
+     * 刚被 reconcile 之后就是这种情况）。而 `pluginManager.updateBundle()`
+     * 内部的 `configure()` 会调 `hmr.runExclusive()`——于是首轮 poll 里的升级
+     * 就会撞上「HMR transactions cannot be nested」。
+     *
+     * 推到下一个宏任务就够了：那时 `apply()` 已经返回，事务也结束了。
+     * 水印与软结束不依赖这一轮，晚一个 tick 没有任何可观察差别。
+     */
+    const first = setTimeout(tick, 0)
+    first?.unref?.()
     return () => {
       alive = false
+      clearTimeout(first)
       if (timer !== undefined) clearTimeout(timer)
     }
   }, 'workbuddy-guard: poll')

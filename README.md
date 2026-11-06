@@ -191,12 +191,50 @@ dsh-workbuddy-account-care（Host 半）
   │     ├─ 读 npm 上 dsh-connect-workbuddy 的 latest
   │     ├─ 判定版本 ≠ 基线 → 写 guard.json（水印，等你选软结束/硬结束）
   │     │                    基线随即推进，同一版本不会反复弹
-  │     └─ npm 有新版本 → dsh plugin add 升级它，写「重启生效」水印
+  │     └─ npm 有新版本 → 写 guard.json 的 upgrade 指令
+  │
+  │   （升级不由脚本执行：脚本是 node 派生的独立进程，
+  │     在 Desktop 里没有 dsh 命令可用，见下节）
   │
   └─ 每 15 秒读一次 guard.json
         ├─ 水印 → 经 HTTP 端点给浏览器半，由它在 shell.overlay 里画
+        ├─ upgrade 指令 → 按环境挑一条路执行安装，结果回写 guard.json
         └─ 软结束指令 → cancel 正在跑的轮次 + followup 一条「本机 provider 已更新…」
 ```
+
+### 升级 `dsh-connect-workbuddy` 的三条路
+
+这个插件同时活在两种宿主里，而它们**没有共同的可执行入口**，所以按环境挑一条：
+
+| 顺序 | 方式 | 适用 | 说明 |
+|---|---|---|---|
+| 1 | `host-service` | DSH Desktop（Electron）、任何装了 `dsh-plugin-manager` 的 profile | 用 `ctx.get('pluginManager')` 调 `installBundle`。与界面里点「更新」同一条 pnpm 路径，装完自动 reconcile `dsh.profile.bundles`，HMR 下可热生效。**不需要 `dsh` 在 PATH 上** |
+| 2 | `dsh-cli` | 命令行启动的 Harness（`dsh web`） | 调 `dsh plugin --profile <p> add <spec>`。Windows 上经 `cmd.exe /c` 调用 `.cmd` |
+| 3 | `none` | 两者都没有 | 只记录、不改动，把结论写进日志与 `--status`，由你手动升 |
+
+**为什么不能只用 CLI**：`scripts/watch.mjs` 是 `node` 派生的独立子进程，它继承的是
+**宿主进程的 PATH**。DSH Desktop 的宿主里没有 `dsh` 命令——安装目录下只有
+`dsh.cmd`，而 Node 从 18.20/20.12/21.7 起修 CVE-2024-27980，**拒绝**在不带 shell
+时 spawn `.cmd`/`.bat`：
+
+```
+execFileSync('dsh', …)              → ENOENT   （PATHEXT 不参与解析）
+execFileSync('…\dsh.cmd', …)        → EINVAL   （防注入保护）
+```
+
+所以 0.0.5 及更早在桌面端的自动升级是 100% 失败的（日志里只有一条
+`spawnSync dsh ENOENT`）。0.0.6 起改为「脚本判定、宿主执行」：桌面端走第 1 条，
+命令行端走第 2 条。
+
+升级指令写在 `guard.json` 的 `upgrade` 字段，宿主每 15 秒读一次。执行结果回写为
+`done` / `failed`，`--status` 可以直接看到当前卡在哪一步：
+
+```bash
+npx dsh-workbuddy-account-care check --status
+# → "upgrade": {"status":"done","method":"host-service","application":"applied", …}
+```
+
+同一个 `from → to` 只会下发一次；失败后最多重试 2 次（防每 3 分钟无限重试）。
 
 水印的生命周期分在两半，各管一段：
 
