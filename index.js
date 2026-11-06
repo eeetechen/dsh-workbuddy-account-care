@@ -369,12 +369,28 @@ function isStaleUntilRestart(watermark) {
  * 宁可漏掉、不可误清。危险水印（「WB 更新了」）永远不在此列。
  */
 const LEGACY_RESTART_TITLE = '插件已升级'
+/** 旧版重启水印的固定正文，用来和「热生效」那条区分。 */
+const LEGACY_RESTART_BODY = '重启 DSH 生效。'
 /** 只认「这次启动前不久」留下的：更早的说明它已经经历了不止一次重启，另有异常。 */
 const LEGACY_WINDOW_MS = 24 * 60 * 60 * 1000
 
 function isLegacyRestartWatermark(watermark) {
   if (watermark === null || watermark?.untilRestart !== undefined) return false
   if (String(watermark.title ?? '') !== LEGACY_RESTART_TITLE) return false
+  /**
+   * **必须连正文一起比。**
+   *
+   * 需求 2 之后，热生效的升级水印也长这样：标题「插件已升级」、
+   * **刻意不带 `untilRestart`**（它靠 `dismissible` 控制收起语义）、
+   * 正文「已热生效，无需重启。」。
+   *
+   * 早先只看标题，于是那条正常的升级提示会在下一次进程启动时被当成
+   * 「旧版残留」静默清掉——用户明明收到了「插件已升级」，重装/重启一次
+   * 就再也看不到。实测就是这么丢的。
+   *
+   * 加上正文匹配后，只认真正的旧版（「重启 DSH 生效。」）。
+   */
+  if (String(watermark.body ?? '') !== LEGACY_RESTART_BODY) return false
   const at = Date.parse(String(watermark.at ?? ''))
   if (!Number.isFinite(at)) return false
   return at < BOOT_AT_MS && BOOT_AT_MS - at < LEGACY_WINDOW_MS
@@ -1158,6 +1174,16 @@ export function apply(ctx, config = {}) {
     const isPending = watermark.pendingDisable === true
     const handled = watermark.handledBy !== undefined
     /**
+     * **升级通知只有「知道了」，不要给它「关闭插件」。**
+     *
+     * 升级提示讲的是「我改过你的环境（connect 从 x 升到 y）」，和
+     * 「WB 更新了、该关插件了」是两件事。把 close 按钮塞进去，用户会以为
+     * 插件升级了需要关掉它——语义完全错位。
+     *
+     * 判据用 `dismissible` / `untilRestart`（升级通知专有字段）。
+     */
+    const isUpgradeNotice = watermark.dismissible === true || watermark.untilRestart === true
+    /**
      * **插件已经关了就别再给「关闭插件 / 硬结束」按钮。**
      *
      * 用户反馈：点软结束/硬结束之后插件确实关掉了，但那条残留的水印上仍然
@@ -1167,11 +1193,13 @@ export function apply(ctx, config = {}) {
      * `=== null`（读不到状态）时保持原行为，不要因为读不到就把按钮藏了。
      */
     const closed = bundleEnabled === false
-    const actions = closed
+    const actions = isUpgradeNotice
       ? ['ack']
-      : ((!isPending || handled)
-          ? ['close', 'ack']
-          : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
+      : closed
+        ? ['ack']
+        : ((!isPending || handled)
+            ? ['close', 'ack']
+            : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
     const same = Array.isArray(watermark.actions)
       && watermark.actions.length === actions.length
       && watermark.actions.every((a, i) => a === actions[i])
