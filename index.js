@@ -1045,36 +1045,53 @@ export function apply(ctx, config = {}) {
    * 为什么放在宿主而不是脚本里：脚本是独立子进程，看不到会话状态；
    * 而这一段每 2 秒就会被调用一次，正好能跟上会话的启停变化。
    */
+  /**
+   * 给水印附上「此刻有没有**后台** wb 会话」的快照。
+   *
+   * **按钮组合以客户端实时计算为准**（见 client.js 的 autoActions）：
+   * 宿主每 2 秒才轮询一次，且早先只在 `revision` 变化时才重算，会话停掉后
+   * 按钮会永远卡在旧组合。客户端订阅了 sessions，会话一停就重算，天然实时。
+   *
+   * 这里仍写一份 `actions`，作用退化为：
+   *   · 没有 `sessions` 服务的降级场景下的兜底
+   *   · `--status` / 排障时能看到宿主视角的判断
+   *
+   * `hadRunningSession` 只统计**后台**会话：当前正在看的那个会话当然也在
+   * running（用户正在跟它说话），把它算进来会让组合恒为「软结束/硬结束」。
+   */
   function withLiveActions(watermark) {
     if (watermark === null || watermark === undefined) return watermark
-    if (watermark.pendingDisable !== true) {
-      /**
-       * 已处理过的水印：用户若**强开了** dsh-connect-workbuddy 并在当前会话
-       * 选了 wb provider，界面上要能再把它关掉（需求 3 最后一条）。
-       *
-       * 这里只补按钮、不改文案：`close` 与 `hard` 走同一条停用路径，
-       * 但「关闭插件」在没有会话要结束的场景下更贴切。
-       * 已经在跑 wb 会话时仍用 `hard` 的说法，因为它真的是在打断东西。
-       */
-      if (watermark.handledBy === undefined) return watermark
-      const busy = hasRunningWorkbuddySession()
-      const actions = busy ? ['hard', 'ack'] : ['close', 'ack']
-      const same = Array.isArray(watermark.actions)
-        && watermark.actions.length === actions.length
-        && watermark.actions.every((a, i) => a === actions[i])
-      return same ? watermark : { ...watermark, actions }
-    }
-    const busy = hasRunningWorkbuddySession()
-    const actions = busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']
+    const busy = hasBackgroundWorkbuddySession()
+    const isPending = watermark.pendingDisable === true
+    const handled = watermark.handledBy !== undefined
+    const actions = (!isPending || handled)
+      ? ['close', 'ack']
+      : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack'])
     const same = Array.isArray(watermark.actions)
       && watermark.actions.length === actions.length
       && watermark.actions.every((a, i) => a === actions[i])
-    // 没变就返回原对象：下游按引用比较，避免每 2 秒让浏览器重渲染一次
+      && watermark.hadRunningSession === busy
+    // 完全没变就返回原对象引用：调用方据此跳过重渲染（每 2 秒都会调一次）
     return same ? watermark : { ...watermark, actions, hadRunningSession: busy }
   }
 
-  /** 现在有没有 workbuddy 会话在跑。判断不了时按「有」处理（保守）。 */
-  function hasRunningWorkbuddySession() {
+  /**
+   * 有没有**后台** workbuddy 会话在跑。
+   *
+   * ⚠️ 宿主侧**没有** `retainedBy.mainView`（那是浏览器端的投影），所以这里
+   * 分辨不出「用户正在看的那个会话」。它会把「当前会话也在 running」算进来，
+   * 于是几乎总是 true。
+   *
+   * 正因为这个局限，按钮组合的**最终决定权在客户端**（client.js 的
+   * autoActions，它订阅 sessions、能读 mainView）。这里的值只用于：
+   *   · 没有 `sessions` 服务时的降级兜底
+   *   · `--status` 里展示宿主视角
+   *
+   * 换句话说：宿主这份答案是「偏保守的近似」，不要把它当成需求语义的权威。
+   * 早先正是把它当权威、还只在 revision 变化时重算，才导致
+   * 「没有后台任务却显示软结束/硬结束」。
+   */
+  function hasBackgroundWorkbuddySession() {
     try {
       const agents = ctx.agents?.list?.() ?? []
       for (const agent of agents) {
@@ -1221,10 +1238,26 @@ export function apply(ctx, config = {}) {
     // 0) 上一次进程留下的「重启生效」水印，在首次发布之前就清掉
     const state = await clearStaleOnce(await readGuardState())
 
-    // 1) 水印：值变了就重推，没变就什么都不做
+    // 1) 水印：值变了就重推，没变也要刷新「后台会话」这类实时字段
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
       current = { watermark: withLiveActions(state.watermark), revision: state.revision, guardFile: state.file }
+    } else if (state.watermark !== null && state.watermark !== undefined) {
+      /**
+       * **revision 没变也要重算 actions。**
+       *
+       * 早先整段逻辑都包在 `if (revision 变了)` 里，于是会话停掉之后
+       * 按钮组合永远停在第一次算出来的那份——用户看到「没有后台任务，
+       * 却还是软结束/硬结束」。revision 只反映 guard.json 的内容版本，
+       * 与会话启停无关，必须单独刷新。
+       *
+       * `withLiveActions` 内部做了「没变化就返回原对象」的短路，所以这里
+       * 每 2 秒调一次不会造成无谓的重渲染。
+       */
+      const next = withLiveActions(state.watermark)
+      if (next !== current.watermark) {
+        current = { ...current, watermark: next }
+      }
     }
 
     // 1.5) 插件升级指令（脚本只负责「想升到哪」，执行在宿主进程里）

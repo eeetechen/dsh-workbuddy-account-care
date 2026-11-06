@@ -310,11 +310,22 @@ window.__ModuleLoader__.load({
             const snap = sessions.list.getSnapshot()
             // 1) 当前正在看的会话：选中即提示（刚切过去、还没发送也算）
             const main = Object.values(snap.byId).find((row) => (row.retainedBy?.mainView ?? 0) > 0)
-            if (main !== undefined && guarded(main)) selected = true
-            // 2) 正在跑的会话
+            const mainIsWb = main !== undefined && guarded(main)
+            if (mainIsWb) selected = true
+            /**
+             * 2) **后台**会话正在跑 wb。
+             *
+             * 必须排除「当前正在看的那个会话」：用户眼前这个会话当然也在
+             * running（他正在跟它说话），把它算进「后台有任务」会让按钮组合
+             * 永远停在「软结束/硬结束」——需求要的是
+             * 「只有前台选 provider、没有后台任务 → 关闭插件/知道了」。
+             *
+             * 判据用 `retainedBy.mainView`：它标记了主视图正在展示哪个会话。
+             */
             for (const id of snap.ids) {
               const row = snap.byId[id]
               if (row === undefined || row.running !== true) continue
+              if ((row.retainedBy?.mainView ?? 0) > 0) continue
               if (guarded(row)) { running = true; break }
             }
           } catch { running = false; selected = false }
@@ -494,6 +505,33 @@ window.__ModuleLoader__.load({
 
       const actions = Array.isArray(watermark.actions) ? watermark.actions : []
       /**
+       * **按钮组合在客户端实时计算**，不用宿主写死的那份。
+       *
+       * 为什么改：宿主 `withLiveActions` 只在 `revision` 变化时才重算，
+       * 而会话启停不会改 revision —— 于是按钮永远卡在第一次算出来的那份。
+       * 用户看到的就是「明明没有后台任务，却还是软结束/硬结束/知道了」。
+       *
+       * 客户端这边订阅了 `sessions`，会话一停就立刻重算，天然是实时的。
+       *
+       * 规则（需求 3）：
+       *   有后台 wb 会话在跑        → soft / hard / ack
+       *   没有后台任务（仅前台选中） → close / ack
+       *
+       * 已处理过的水印（`handledBy` 存在）永远用 close/ack 那一套：
+       * 它只在用户强开插件后才出现，此时该做的事就是再关掉。
+       */
+      const isPending = watermark.pendingDisable === true
+      const hasBackground = usage.running === true
+      const autoActions = watermark.handledBy !== undefined || !isPending
+        ? ['close', 'ack']
+        : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack'])
+      /**
+       * 升级类水印（带 `dismissible` 或 `untilRestart`）保留宿主给的 actions：
+       * 它们只有「知道了」一个按钮，与有没有会话无关。
+       */
+      const isUpgradeCard = watermark.dismissible === true || watermark.untilRestart === true
+      const effectiveActions = isUpgradeCard ? actions : autoActions
+      /**
        * 按钮表由**宿主**决定（`actions` 字段），客户端只负责画。
        *
        * 需求 3 要求两套形态：
@@ -533,8 +571,8 @@ window.__ModuleLoader__.load({
             : '先收起这条提示（还在用 WorkBuddy 时它会再次出现）',
         },
       }
-      /** 按宿主给的顺序画；未知 action 直接忽略。 */
-      const visibleActions = actions.filter((action) => BUTTONS[action] !== undefined)
+      /** 按算出来的顺序画；未知 action 直接忽略。 */
+      const visibleActions = effectiveActions.filter((action) => BUTTONS[action] !== undefined)
 
       return h('div', { className: 'dsh-wbg-root' }, h('div', {
         className: leaving ? 'dsh-wbg-card dsh-wbg-leaving' : 'dsh-wbg-card',
