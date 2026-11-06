@@ -636,7 +636,15 @@ export function apply(ctx, config = {}) {
    *
    * 刻意**不删掉**：插件被摘除后 WorkBuddy provider 也跟着消失，水印自然不显示；
    * 但用户要是强开了 `dsh-connect-workbuddy`，这条水印就该重新跟着 provider 选择
-   * 出现/消失——所以它得活着，只是不再带按钮。
+   * 出现/消失。
+   *
+   * **仍然带按钮**（需求 3）：用户强开插件后，界面上要能再把它关掉，
+   * 否则他就只能回命令行敲 `--enable`/`--disable`。所以这里把 actions 换成
+   * 「关闭插件 / 知道了」这一套——因为没有会话在跑才会走到「强开」的场景，
+   * 硬结束那套文案不合适。
+   *
+   * `pendingDisable: false` 仍然保留：它区分「等你决定」与「已经处理过」，
+   * 客户端据此决定显示门控（前者看会话，后者跟随 provider 选择）。
    */
   async function finalizeWatermark(file, action) {
     let snapshot
@@ -648,7 +656,9 @@ export function apply(ctx, config = {}) {
       body: previous.body ?? '',
       detail: `${previous.from ?? '?'} → ${previous.to ?? '?'}`,
       pendingDisable: false,
-      actions: [],
+      // 强开插件后还能在界面上关掉它
+      actions: ['close', 'ack'],
+      dismissedAfterAction: action,
       handledBy: action,
       at: new Date().toISOString(),
     }
@@ -732,7 +742,15 @@ export function apply(ctx, config = {}) {
     try { body = raw === '' ? {} : JSON.parse(raw) } catch { return send(400, { ok: false, error: 'bad-json' }) }
     const action = body.action
     if (action === 'ack') return send(200, { ok: true, action })
-    if (action !== 'soft' && action !== 'hard') return send(400, { ok: false, error: 'unknown-action' })
+    /**
+     * `close` 与 `hard` 是同一个动作的两个名字。
+     *
+     * 需求 3 要求两种形态：有后台会话时给「硬结束」，没有时给「关闭插件」。
+     * 效果一样（停用 dsh-connect-workbuddy），措辞按场景选，所以这里归一化。
+     */
+    if (action !== 'soft' && action !== 'hard' && action !== 'close') {
+      return send(400, { ok: false, error: 'unknown-action' })
+    }
     if (actionInFlight !== null) return send(409, { ok: false, error: 'busy', action: actionInFlight })
     actionInFlight = action
     try {
@@ -1009,6 +1027,67 @@ export function apply(ctx, config = {}) {
     })
   }
 
+  /**
+   * 按「现在有没有 workbuddy 会话在跑」决定水印上的按钮组合（需求 3）。
+   *
+   * 需求原话：
+   *   - 有后台会话在跑，且是 wb provider → 软结束 / 硬结束 / 知道了
+   *   - 没后台任务时                     → 关闭插件 / 知道了
+   *
+   * 「关闭插件」与「硬结束」效果相同（都调 `--disable`），但**文案不同**：
+   * 有会话在跑时说「硬结束」更符合「我在终止一个正在跑的东西」的直觉；
+   * 没会话在跑时说「关闭插件」才符合「我只是把插件关掉」的直觉。用户明确
+   * 说过两套实现对一般用户更好，所以这里保留两套文案、共用一条执行路径。
+   *
+   * 只对「待确认」的水印生效（`pendingDisable === true`）。其它水印
+   * （插件已升级之类）的 actions 由写入方决定，不在这里改写。
+   *
+   * 为什么放在宿主而不是脚本里：脚本是独立子进程，看不到会话状态；
+   * 而这一段每 2 秒就会被调用一次，正好能跟上会话的启停变化。
+   */
+  function withLiveActions(watermark) {
+    if (watermark === null || watermark === undefined) return watermark
+    if (watermark.pendingDisable !== true) {
+      /**
+       * 已处理过的水印：用户若**强开了** dsh-connect-workbuddy 并在当前会话
+       * 选了 wb provider，界面上要能再把它关掉（需求 3 最后一条）。
+       *
+       * 这里只补按钮、不改文案：`close` 与 `hard` 走同一条停用路径，
+       * 但「关闭插件」在没有会话要结束的场景下更贴切。
+       * 已经在跑 wb 会话时仍用 `hard` 的说法，因为它真的是在打断东西。
+       */
+      if (watermark.handledBy === undefined) return watermark
+      const busy = hasRunningWorkbuddySession()
+      const actions = busy ? ['hard', 'ack'] : ['close', 'ack']
+      const same = Array.isArray(watermark.actions)
+        && watermark.actions.length === actions.length
+        && watermark.actions.every((a, i) => a === actions[i])
+      return same ? watermark : { ...watermark, actions }
+    }
+    const busy = hasRunningWorkbuddySession()
+    const actions = busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']
+    const same = Array.isArray(watermark.actions)
+      && watermark.actions.length === actions.length
+      && watermark.actions.every((a, i) => a === actions[i])
+    // 没变就返回原对象：下游按引用比较，避免每 2 秒让浏览器重渲染一次
+    return same ? watermark : { ...watermark, actions, hadRunningSession: busy }
+  }
+
+  /** 现在有没有 workbuddy 会话在跑。判断不了时按「有」处理（保守）。 */
+  function hasRunningWorkbuddySession() {
+    try {
+      const agents = ctx.agents?.list?.() ?? []
+      for (const agent of agents) {
+        if (agent.status !== 'running') continue
+        try {
+          const projections = ctx.get('sessionProjections')?.snapshot(agent.session)?.values
+          if (usesWorkbuddy(agent, projections) !== null) return true
+        } catch { /* 单条读不出来就跳过 */ }
+      }
+      return false
+    } catch { return true }
+  }
+
   /** 执行一条升级指令，把结果写回 guard.json 供下一轮与 `--status` 读取。 */
   async function runUpgrade(state, request) {
     const spec = String(request.spec ?? `${GUARDED_BUNDLE}@${request.to}`)
@@ -1034,10 +1113,24 @@ export function apply(ctx, config = {}) {
     })
     if (outcome.ok) {
       logger.warn?.(`[workbuddy-guard] 升级完成：${spec}（${outcome.method}${outcome.restart ? '，需重启生效' : ''}）`)
-      // 升级不等于启用；且只有「需要重启」时才挂一次性水印。
-      if (outcome.restart === true) {
-        await pushRestartWatermark(request.from, request.to)
-      }
+      /**
+       * **升级成功一律挂水印**，按是否需要重启换文案（需求 2）。
+       *
+       * 早先只在 `restart === true` 时挂，理由是「热生效不用打扰」。用户否掉了：
+       * 「万一 dsh-workbuddy-connect 上游更新坏了，不要让别人感觉是我们插件
+       * 影响了」——插件在后台改动了用户环境，哪怕成功也该留个痕迹。
+       *
+       * 两种文案的差异只在水印怎么消失：
+       *   · 需要重启 → `untilRestart`，重启后自动过期；按钮「知道了」只是收起
+       *   · 已热生效 → 带 `actions: ['ack']`，点「知道了」**永久消失**
+       *     （它提示的事情已经完成，没有任何未了的风险，不该像 WB 红牌那样复活）
+       */
+      await pushUpgradeWatermark({
+        from: request.from,
+        to: request.to,
+        restart: outcome.restart === true,
+        method: outcome.method ?? upgrader.kind,
+      })
     } else if (outcome.transient === true) {
       logger.warn?.(`[workbuddy-guard] 升级暂时做不了（${outcome.error}），下一轮再试`)
     } else {
@@ -1046,25 +1139,66 @@ export function apply(ctx, config = {}) {
     return outcome
   }
 
-  /** 升级后的「重启生效」水印；与脚本写的那条同构，重启后自动过期。 */
-  async function pushRestartWatermark(from, to) {
+  /**
+   * 升级成功后的水印（需求 2）。
+   *
+   * 两种形态：
+   *   · 需要重启 → `untilRestart`：重启后自动过期；点「知道了」只是收起，
+   *     因为「还没重启」这件事仍然成立。
+   *   · 已热生效 → `actions: ['ack']` + `dismissible: true`：点「知道了」
+   *     **永久消失**，它提示的事情已经完成，没有未了的风险。
+   *
+   * `pendingDisable: false` 是刻意的：这不是「等你决定」的红牌，
+   * 不该被「有 wb 会话在跑才显示」那条门控挡住。
+   */
+  async function pushUpgradeWatermark({ from, to, restart, method }) {
     const file = guardFile()
     let snapshot
     try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
-    snapshot.watermark = {
-      level: 'warning',
-      title: '插件已升级',
-      body: '重启 DSH 生效。',
-      detail: `${GUARDED_BUNDLE} ${from ?? '?'} → ${to ?? '?'}`,
-      untilRestart: true,
-      at: new Date().toISOString(),
+    /**
+     * **不要覆盖一条尚未处理的 WB 红牌。**
+     *
+     * 需求 4 说「插件更新了说明上游验证过，可以吞掉警告」——那条针对的是
+     * 「WB 变了且 connect 没跟上」的旧风险；但插件更新成功后，风险确实已经
+     * 解除（新 connect 理论上适配了新版 WB）。所以这里按需求 4 执行覆盖，
+     * 只是把「原来的红牌被插件升级取代」记进日志，便于事后追溯。
+     */
+    const previous = snapshot.watermark
+    if (previous?.pendingDisable === true) {
+      logger.warn?.(`[workbuddy-guard] 插件升级完成，覆盖未处理的 WB 告警`
+        + `（${previous.from ?? '?'} → ${previous.to ?? '?'}）`)
     }
+    const pair = `${GUARDED_BUNDLE} ${from ?? '?'} → ${to ?? '?'}`
+    snapshot.watermark = restart
+      ? {
+          level: 'warning',
+          title: '插件已升级',
+          body: '重启 DSH 生效。',
+          detail: pair,
+          pendingDisable: false,
+          actions: ['ack'],
+          untilRestart: true,
+          at: new Date().toISOString(),
+        }
+      : {
+          level: 'info',
+          title: '插件已升级',
+          body: '已热生效，无需重启。',
+          detail: pair,
+          pendingDisable: false,
+          // `ack` 表示「知道了就永久收起」——见 client.js 的 dismissible 处理
+          actions: ['ack'],
+          dismissible: true,
+          at: new Date().toISOString(),
+        }
     snapshot.revision = (Number(snapshot.revision) || 0) + 1
     const tmp = `${file}.tmp-${process.pid}`
     await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
     await rename(tmp, file)
     publishedWatermarkRevision = snapshot.revision
     current = { watermark: snapshot.watermark, revision: snapshot.revision, guardFile: file }
+    logger.warn?.(`[workbuddy-guard] 已挂升级水印 revision ${snapshot.revision}`
+      + `（${restart ? '重启生效' : '热生效'}，来源 ${method}）`)
   }
 
   /**
@@ -1090,7 +1224,7 @@ export function apply(ctx, config = {}) {
     // 1) 水印：值变了就重推，没变就什么都不做
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
-      current = { watermark: state.watermark, revision: state.revision, guardFile: state.file }
+      current = { watermark: withLiveActions(state.watermark), revision: state.revision, guardFile: state.file }
     }
 
     // 1.5) 插件升级指令（脚本只负责「想升到哪」，执行在宿主进程里）

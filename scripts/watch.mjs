@@ -967,6 +967,12 @@ async function main() {
       profileResolution: profileResolutionReport(),
       bundleSelected: bundleSelected(),
       baselineVersion: state.baseline?.version ?? null,
+      /**
+       * 落基线时 `dsh-connect-workbuddy` 的版本——「风险配对」的另一半（需求 1）。
+       * 判定的完整条件是：WB 版本变了 **且** connect 仍是这个版本。
+       * 它与 `pluginInstalled` 不一致，就说明 connect 已经跟上、风险窗口关闭。
+       */
+      baselineConnectVersion: state.baseline?.connectVersion ?? null,
       baselinePlatform: state.baseline?.platformId ?? null,
       baselineAt: state.baseline?.updatedAt ?? null,
       baselineSource: state.baseline?.source ?? null,
@@ -1172,6 +1178,28 @@ async function main() {
 
   const config = effectiveConfig()
 
+  /**
+   * `dsh-connect-workbuddy` 的两个版本，**必须在判定之前拿到**。
+   *
+   *   connectVersion —— 本机磁盘上装的是哪个版本（「现在这一对」的前一半）
+   *   connectLatest  —— npm 上的最新版（「能不能跟上」的后一半）
+   *
+   * 判定口径（2026-11-06 改，见 docs/需求.md 流程 1）：
+   *
+   *   WB 版本变了 **且** connect 没有跟上 → 报警（高风险窗口）
+   *   WB 版本变了 **但** connect 已跟上 → 不报警（上游已验证适配）
+   *   WB 版本没变                      → 不报警
+   *
+   * 早先只看 WB 版本：只要 WB 一变就红牌。但那样有个假阳性——插件作者
+   * 已经发布了适配新版 WB 的 connect，用户也装了，却仍然被告知「别用」。
+   * 需求明确要求「以这两个版本为主」，所以配对判定。
+   */
+  const connectBefore = readInstalledPlugin()
+  const connectInstalledVersion = SIMULATE_PLUGIN !== null ? SIMULATE_PLUGIN : connectBefore.version
+  let connectLatest = { ok: false, error: 'disabled' }
+  if (!NO_UPGRADE) connectLatest = await readPluginLatest()
+  const connectVersion = connectInstalledVersion ?? null
+
   const events = []
   const firstRun = !state.baseline
   const reported = new Set(state.reportedKeys ?? [])
@@ -1225,21 +1253,70 @@ async function main() {
     return true
   }
 
-  // 1) 版本号对不上 —— 唯一的停用触发器
+  // 1) 版本配对 —— 唯一的停用触发器
   //
   // 比的是字符串本身，不比大小：降级（接口回退到旧版本）同样算「变了」，
   // 因为客户端被换成旧构建同样可能让插件的私有接口失效。
+  //
+  // **判定口径（需求 1）**：报警要同时满足两件事
+  //   a. WB 客户端版本变了（相对基线）
+  //   b. dsh-connect-workbuddy 没有跟上
+  //
+  // 「跟上」的判据：基线里记的 connectVersion 与**现在装的**不同，
+  // 或者现在装的就是 npm latest —— 前者说明升级发生过，后者说明已是最新。
+  //
+  // 为什么这样定义：需求说「以这两个版本为主」，基线记的是一对
+  // (WB 版本, connect 版本)。只要这一对的原样还在，就说明用户仍在
+  // 「旧 connect 面对新 WB」的高风险组合里；一旦 connect 动过（升到任何
+  // 更新的版本、包括用户手动装），风险窗口就关闭了。
   let versionChanged = false
-  // 版本是否真的不一致（跟「这一轮有没有报出来」分开：去重会让事件为 0）。
-  const mismatch = judgedVersion !== null && !firstRun && !reanchor
-    && state.baseline.version !== judgedVersion
+  const recordedWb = state.baseline?.version ?? null
+  const recordedConnect = state.baseline?.connectVersion ?? null
+  // WB 是否真的变了（跟「这一轮有没有报出来」分开：去重会让事件为 0）。
+  const wbMismatch = judgedVersion !== null && !firstRun && !reanchor
+    && recordedWb !== judgedVersion
+  /**
+   * connect 是否「没跟上」。
+   *
+   * 三种情形算跟上（= 不报警）：
+   *   · 现在装的版本与基线记的不同（升级发生过）
+   *   · 现在装的就是 npm 最新（没有更新的可装）
+   *
+   * 什么都不算的情形：
+   *   · 读不到 connect 版本（信息不足，不猜）
+   *
+   * **老状态文件没有 `connectVersion`（本字段后加）→ 不参与「跟上」判断。**
+   * 那一轮只能比 WB 版本，等于退回旧行为（WB 一变就报警）。
+   *
+   * 这里刻意**不**把「已是最新」当成老基线的豁免理由：迁移那一刻用户可能
+   * 正处在「新 WB + 旧 connect」里，而那个 connect 恰好也是 latest（上游还没
+   * 发新版）——放行就等于漏掉唯一真正该报的场景。宁可多报一次，让用户在
+   * 界面上看到并决定。
+   */
+  const connectUnknownBaseline = recordedConnect === null || recordedConnect === undefined
+  const connectMoved = !connectUnknownBaseline && connectInstalledVersion !== null
+    && recordedConnect !== connectInstalledVersion
+  const connectIsLatest = connectLatest.ok && connectInstalledVersion !== null
+    && compareVersions(connectLatest.version, connectInstalledVersion) <= 0
+  const connectCaughtUp = !connectUnknownBaseline && (connectMoved || connectIsLatest)
+  if (connectUnknownBaseline && wbMismatch) {
+    log('warn', '基线里没有 connect 版本（旧格式），本轮按「只比 WB 版本」处理')
+  }
+  /** 真正的风险窗口：WB 变了，而 connect 还是基线里那个。 */
+  const mismatch = wbMismatch && !connectCaughtUp
+  if (wbMismatch && connectCaughtUp) {
+    log('info', `WB 版本变了（${recordedWb} → ${judgedVersion}），但 ${BUNDLE} 已跟上`
+      + `（基线 ${recordedConnect ?? '?'} → 现装 ${connectInstalledVersion ?? '?'}`
+      + `${connectIsLatest ? '，且已是最新' : ''}）—— 不报警`)
+  }
   if (judgedVersion === null) {
     // 两路都拿不到版本就**什么都不做**：不推进基线、不报事件、不挂提示。
     log('warn', `所有判定平台都取不到版本（${judging.length === 0 ? '无可用平台' : ''}）—— 本轮不判定`)
   } else if (firstRun || reanchor) {
-    log('info', `落基线：${sources === 'both' ? '接口与文件名一致' : '仅接口'} 版本 ${judgedVersion}（不报警）`)
+    log('info', `落基线：${sources === 'both' ? '接口与文件名一致' : '仅接口'} 版本 ${judgedVersion}`
+      + `，配对 ${BUNDLE}@${connectVersion ?? '未知'}（不报警）`)
   } else if (mismatch) {
-    const recorded = state.baseline.version
+    const recorded = recordedWb
     versionChanged = pushEvent({
       at: nowIso(),
       kind: 'wb-version-changed',
@@ -1249,22 +1326,27 @@ async function main() {
       url: `https://www.workbuddy.cn/v2/update?platform=${judgedFrom[0] ?? PLATFORM_ID}`,
       judgedFrom,
       platforms: platformResults.map((r) => ({ platform: r.platform, version: r.version })),
+      connectVersion: connectInstalledVersion ?? null,
+      connectBaseline: recordedConnect ?? null,
     })
     if (versionChanged) {
       log('warn', `WorkBuddy 版本不一致：记录 ${recorded} → ${judgedVersion}`
-        + `（来自 ${judgedFrom.join(' + ')}）`)
+        + `（来自 ${judgedFrom.join(' + ')}），而 ${BUNDLE} 仍在 ${connectInstalledVersion ?? '?'}`
+        + `（基线 ${recordedConnect ?? '?'}）`)
     }
   }
 
   // 3) 插件自身版本 —— 有新版就地升级，并挂「重启生效」水印
-  const pluginBefore = readInstalledPlugin()
-  let pluginLatest = { ok: false, error: 'disabled' }
-  if (!NO_UPGRADE) pluginLatest = await readPluginLatest()
+  //
+  // 版本值已在判定之前读过（见 connectVersion / connectLatest），这里只做
+  // 「要不要升级」的决策，避免同一轮重复读磁盘与打 registry。
+  const pluginBefore = connectBefore
+  const pluginLatest = connectLatest
 
   let pluginUpgrade = null
   let pluginNewer = false
   let PLUGIN_UNKNOWN_REASON = null
-  const installedVersion = SIMULATE_PLUGIN !== null ? SIMULATE_PLUGIN : pluginBefore.version
+  const installedVersion = connectInstalledVersion
   if (installedVersion === null || installedVersion === undefined) {
     PLUGIN_UNKNOWN_REASON = `读不到已安装版本（${pluginBefore.path}）`
   }
@@ -1350,7 +1432,10 @@ async function main() {
        * 「软结束」或「硬结束」。呵护插件不替用户决定什么时候掐断他的会话——
        * 一个正在跑的任务被自动中止，比晚几秒停用糟糕得多。
        *
-       * 水印上带 `pendingDisable` 与 `actions`，浏览器半据此画出三个按钮。
+       * `actions` 这里先写一个**保守的默认值**（有会话在跑的那套）。真正的
+       * 按钮组合由宿主按「此刻有没有 wb 会话在跑」动态改写（见 index.js 的
+       * `withLiveActions`）：没会话在跑时会换成「关闭插件 / 知道了」。
+       * 之所以不在脚本里判：脚本是独立子进程，看不到会话状态。
        */
       pendingDisable = true
       updateWatermark({
@@ -1359,11 +1444,13 @@ async function main() {
         body: '还用，你的账号是批发的吗？',
         detail: `${trigger.from} → ${trigger.to}`,
         pendingDisable: true,
-        actions: ['soft', 'hard'],
+        actions: ['soft', 'hard', 'ack'],
         from: trigger.from,
         to: trigger.to,
+        connectVersion: connectInstalledVersion ?? null,
       })
-      log('warn', `检测到 WorkBuddy 版本变化（${trigger.from} → ${trigger.to}），已挂提示，等待用户选择软结束/硬结束`)
+      log('warn', `检测到 WorkBuddy 版本变化（${trigger.from} → ${trigger.to}），`
+        + `${BUNDLE} 仍在 ${connectInstalledVersion ?? '?'}，已挂提示等待用户选择`)
     }
   } else if (triggers.length > 0 && MODE_CHECK) {
     log('info', `--check 模式：命中 ${triggers.length} 个停用条件，但不修改 profile`)
@@ -1387,6 +1474,17 @@ async function main() {
     if (judgedVersion !== null && !simulated && !MODE_CHECK) {
       state.baseline = {
         version: judgedVersion,
+        /**
+         * 落基线时 `dsh-connect-workbuddy` 是**哪个版本**。
+         *
+         * 这就是「风险配对」的另一半：只有当 (WB 版本, connect 版本) 这一对
+         * 出现在基线里，才说明「这个 connect 版本见的就是这个 WB 版本」。
+         * 判定因此变成：WB 变了 **且** connect 没跟着变 → 才报警。
+         *
+         * 与 `version` 同级存放而不是单开一个字段，是为了让 `--status` 一眼
+         * 看到「当前配对」。旧状态文件没有这个键时按「未知」处理（见下）。
+         */
+        connectVersion: connectVersion,
         /** 本机是哪个平台（只做记录，不再决定判定范围）。 */
         platformId: PLATFORM_ID,
         /** 参与判定的平台集合。这份名单变了就要重锚，否则会误判成「客户端更新」。 */

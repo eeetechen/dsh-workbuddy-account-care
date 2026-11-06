@@ -345,24 +345,15 @@ window.__ModuleLoader__.load({
       const revision = state?.revision ?? null
       const usage = useWorkbuddyUsage(sessions)
       /**
-       * 显示门控：**只要当前会话选中了 workbuddy，就该提示**——无论有没有
-       * 会话在真正跑。
+       * 显示门控（需求 3）：**只要还在用 workbuddy 就显示**，
+       * 三条来源任一命中：
        *
-       * 早先这里写成 `pending ? usage.running : (usage.running || usage.selected)`，
-       * 于是「待确认」阶段只认 `running`：用户在新会话里把 provider 切成
-       * workbuddy、但还没发消息时，水印不出现；直到他发出第一条消息、会话
-       * 进入运行态才浮现。用户看到的就是「水印没跟随选择，要发一条消息才出来」
-       * ——那正是他选择它的**那一刻**最该被提醒，晚一步就来不及了。
+       *   1. 当前正在看的会话选中了 wb provider（切换那一刻就算，不用发消息）
+       *   2. 任何后台会话正在跑 wb provider（切到别的界面也照样显示）
+       *   3. 已停用后用户强开了插件，且当前会话是 wb（同样被 1 覆盖）
        *
-       * 「没在跑就不打扰」的初衷可以理解，但真正制造打扰的是「没在用 WorkBuddy
-       * 的人被弹窗」，而 `selected` 恰恰证明他正在用。所以两个阶段统一：
-       *
-       *   选中 workbuddy（当前会话）  → 显示
-       *   有 workbuddy 会话在跑      → 显示
-       *   两者都没有                → 不显示
-       *
-       * 注意 `usage.selected` 看的是 `mainView` 那个会话的 provider 投影，
-       * 是**切换那一刻**就变了的值，不需要等消息。
+       * 三个都不成立 → 不显示。这正是需求第 25 行要的
+       * 「所有 wb 后台结束、且当前会话不是 wb → 自然消失」。
        */
       const gateOpen = usage.running || usage.selected
 
@@ -441,6 +432,14 @@ window.__ModuleLoader__.load({
         leaveTimer.current = setTimeout(() => {
           setSnoozedRevision(revision)
           setLeaving(false)
+          /**
+           * `dismissible: true` 的水印点了之后**永久收起**，不再复活。
+           *
+           * 这类水印提示的是一件**已经完成**的事（例如「插件已升级，已热生效」），
+           * 没有未了的风险，反复弹只会让人烦。而 WB 版本来不及适配那种红牌
+           * 不带这个字段——它必须一直提醒到用户真的处理为止。
+           */
+          if (watermark?.dismissible === true) return
           // 只有「还在用 WorkBuddy」才重新浮出来；没在用就安静地收着
           reshowTimer.current = setTimeout(() => {
             if (!gateRef.current) return
@@ -490,10 +489,52 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const actions = Array.isArray(watermark.actions) ? watermark.actions : []
-      const canSoft = actions.includes('soft')
-      const canHard = actions.includes('hard')
+      /** 按钮文字：正在执行的那个显示进行时文案。 */
       const label = (action, idle, running) => (busy === action ? running : idle)
+
+      const actions = Array.isArray(watermark.actions) ? watermark.actions : []
+      /**
+       * 按钮表由**宿主**决定（`actions` 字段），客户端只负责画。
+       *
+       * 需求 3 要求两套形态：
+       *   有后台 wb 会话 → soft / hard / ack
+       *   没有后台 wb 会话 → close / ack
+       *
+       * 其中 `close` 与 `hard` 的**效果相同**（都是停用 dsh-workbuddy-connect），
+       * 只是文案不同：有会话在跑时说「硬结束」更像在终止什么，没会话在跑时说
+       * 「关闭插件」才符合用户脑中的模型。两套实现是刻意的——共用一套代码、
+       * 只是把按钮表当数据传下来。
+       */
+      const BUTTONS = {
+        soft: {
+          label: '软结束',
+          running: '正在结束…',
+          className: 'dsh-wbg-btn--soft',
+          title: '给正在跑的会话发一条暂停消息，等它停下来再停用插件',
+        },
+        hard: {
+          label: '硬结束',
+          running: '正在停用…',
+          className: 'dsh-wbg-btn--hard',
+          title: '立刻停用 dsh-connect-workbuddy（正在跑的会话会被打断）',
+        },
+        close: {
+          label: '关闭插件',
+          running: '正在关闭…',
+          className: 'dsh-wbg-btn--hard',
+          title: '停用 dsh-connect-workbuddy',
+        },
+        ack: {
+          label: '知道了',
+          running: '知道了',
+          className: '',
+          title: watermark.dismissible === true
+            ? '收起这条提示（不再出现）'
+            : '先收起这条提示（还在用 WorkBuddy 时它会再次出现）',
+        },
+      }
+      /** 按宿主给的顺序画；未知 action 直接忽略。 */
+      const visibleActions = actions.filter((action) => BUTTONS[action] !== undefined)
 
       return h('div', { className: 'dsh-wbg-root' }, h('div', {
         className: leaving ? 'dsh-wbg-card dsh-wbg-leaving' : 'dsh-wbg-card',
@@ -516,31 +557,17 @@ window.__ModuleLoader__.load({
           : h('div', { className: 'dsh-wbg-detail', style: { color: 'var(--wbg-accent)' } }, `操作失败：${failed}`),
       ),
       h('div', { className: 'dsh-wbg-actions' },
-        canSoft
-          ? h('button', {
+        ...visibleActions.map((action) => {
+          const spec = BUTTONS[action]
+          return h('button', {
+            key: action,
             type: 'button',
-            className: 'dsh-wbg-btn dsh-wbg-btn--soft',
+            className: `dsh-wbg-btn ${spec.className}`.trim(),
             disabled: busy !== null,
-            onClick: () => { void runAction('soft') },
-            title: '给正在跑的会话发一条暂停消息，等它停下来再停用插件',
-          }, label('soft', '软结束', '正在结束…'))
-          : null,
-        canHard
-          ? h('button', {
-            type: 'button',
-            className: 'dsh-wbg-btn dsh-wbg-btn--hard',
-            disabled: busy !== null,
-            onClick: () => { void runAction('hard') },
-            title: '立刻停用 dsh-connect-workbuddy（正在跑的会话会被打断）',
-          }, label('hard', '硬结束', '正在停用…'))
-          : null,
-        h('button', {
-          type: 'button',
-          className: 'dsh-wbg-btn',
-          disabled: busy !== null,
-          onClick: () => { void runAction('ack') },
-          title: '先收起这条提示（还在用 WorkBuddy 时它会再次出现）',
-        }, '知道了'),
+            onClick: () => { void runAction(action) },
+            title: spec.title,
+          }, label(action, spec.label, spec.running))
+        }),
       )))
     }
 
