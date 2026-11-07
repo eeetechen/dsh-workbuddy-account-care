@@ -333,11 +333,19 @@ async function readGuardState() {
       watermark: parsed?.watermark ?? null,
       stopSessions: parsed?.stopSessions ?? null,
       upgrade: parsed?.upgrade ?? null,
+      /**
+       * 用户点过「知道了」的那个 revision。
+       *
+       * 必须在这里透出来：`pollOnce` 靠它决定还要不要发布这条水印。
+       * 漏掉这个字段的后果是 ack 落盘了却不生效——界面收起、刷新又回来，
+       * 正是用户报的那个 bug。
+       */
+      ackedRevision: Number.isFinite(parsed?.ackedRevision) ? parsed.ackedRevision : null,
     }
   } catch (error) {
     return {
       ok: false, file, mtimeMs: 0, revision: 0,
-      watermark: null, stopSessions: null, upgrade: null,
+      watermark: null, stopSessions: null, upgrade: null, ackedRevision: null,
       error: String(error?.message || error),
     }
   }
@@ -834,7 +842,30 @@ export function apply(ctx, config = {}) {
     let body = {}
     try { body = raw === '' ? {} : JSON.parse(raw) } catch { return send(400, { ok: false, error: 'bad-json' }) }
     const action = body.action
-    if (action === 'ack') return send(200, { ok: true, action })
+    /**
+     * `ack` —— 用户点了「知道了」。
+     *
+     * **必须在这里持久化，不能只让浏览器收起卡片。**
+     *
+     * 早先这里直接 `return send(200, {ok:true})`，什么都不做；客户端的
+     * `onDismiss` 也只改 React 状态（`useState`），刷新即失效。结果是
+     * 「点了知道了、刷新页面它又回来了」——因为 Host 的 guard.json 里
+     * 那条水印一直都在，每次页面加载都重新下发。
+     *
+     * 现在按需求 2 的「点击之后直接消失」：把这条水印标记为已确认并落盘。
+     * 之后 `pollOnce` 读到 `ackedRevision === revision` 就不再发布它。
+     * revision 一抬高（新一次告警）自然复位，不需要额外清理。
+     */
+    if (action === 'ack') {
+      const revision = Number(body.revision)
+      try {
+        await ackWatermark(Number.isFinite(revision) ? revision : null)
+      } catch (error) {
+        logger.error?.(`[workbuddy-guard] 记录「知道了」失败: ${String(error?.message || error)}`)
+        return send(500, { ok: false, action, error: 'ack-failed' })
+      }
+      return send(200, { ok: true, action })
+    }
     /**
      * `close` 与 `hard` 是同一个动作的两个名字。
      *
@@ -1239,6 +1270,39 @@ export function apply(ctx, config = {}) {
     } catch { return true }
   }
 
+  /**
+   * 把当前水印标记为「用户已点知道了」，并落盘。
+   *
+   * 为什么写进 guard.json 而不是只用内存：用户点掉之后**刷新页面**或
+   * **重启 DSH** 都不该再出现（需求 2「点击之后直接消失」）。内存变量跨
+   * 不了这两件事，必须落盘。
+   *
+   * 记录的是 **revision**：水印内容一变（新一次 WB 告警、又一次升级），
+   * revision 就会被抬高，`ackedRevision` 自动失效，新提示照常出现。
+   *
+   * `revision` 传 null 时按「当前水印的 revision」处理——客户端老版本没带
+   * 这个字段时也不至于记不住。
+   */
+  async function ackWatermark(revision) {
+    const file = guardFile()
+    let snapshot
+    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
+    const target = Number.isFinite(revision) ? revision : Number(snapshot.revision) || 0
+    snapshot.ackedRevision = target
+    snapshot.ackedAt = new Date().toISOString()
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+    await rename(tmp, file)
+    /**
+     * 立刻把内存里的 `current` 也清掉，不等下一轮 poll。
+     *
+     * 否则用户点完「知道了」，卡片虽然本地收起了，只要页面一刷新，
+     * Host 又会把同一条下发一次（因为 `current` 还停在旧值）。
+     */
+    current = { ...current, watermark: null }
+    logger.warn?.(`[workbuddy-guard] 用户确认了水印 revision ${target}，不再显示`)
+  }
+
   /** 执行一条升级指令，把结果写回 guard.json 供下一轮与 `--status` 读取。 */
   async function runUpgrade(state, request) {
     const spec = String(request.spec ?? `${GUARDED_BUNDLE}@${request.to}`)
@@ -1378,18 +1442,29 @@ export function apply(ctx, config = {}) {
     // 0) 上一次进程留下的「重启生效」水印，在首次发布之前就清掉
     const state = await clearStaleOnce(await readGuardState())
 
+    /**
+     * 用户已经点过「知道了」的那条，不再发布。
+     *
+     * 判据是 revision 相等：水印内容一变，revision 就被抬高，这里自动失效，
+     * 新提示照常出现。所以不需要清理 `ackedRevision`，也不需要定时器。
+     */
+    const acked = state.watermark !== null
+      && state.watermark !== undefined
+      && Number(state.ackedRevision) === Number(state.revision)
+    const effectiveWatermark = acked ? null : state.watermark
+
     // 1) 水印：值变了就重推，没变也要刷新「后台会话 / 插件开关」这类实时字段
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
       // 动作刚完成时 bundle 可能刚被停用，强制刷新，别等缓存过期
       const enabled = await currentBundleEnabled(true)
       current = {
-        watermark: withLiveActions(state.watermark, enabled),
+        watermark: withLiveActions(effectiveWatermark, enabled),
         revision: state.revision,
         guardFile: state.file,
         bundleEnabled: enabled,
       }
-    } else if (state.watermark !== null && state.watermark !== undefined) {
+    } else if (effectiveWatermark !== null && effectiveWatermark !== undefined) {
       /**
        * **revision 没变也要重算 actions。**
        *
@@ -1402,7 +1477,7 @@ export function apply(ctx, config = {}) {
        * 每 2 秒调一次不会造成无谓的重渲染。
        */
       const enabled = await currentBundleEnabled()
-      const next = withLiveActions(state.watermark, enabled)
+      const next = withLiveActions(effectiveWatermark, enabled)
       if (next !== current.watermark || enabled !== current.bundleEnabled) {
         current = { ...current, watermark: next, bundleEnabled: enabled }
       }

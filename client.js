@@ -507,16 +507,34 @@ window.__ModuleLoader__.load({
        */
       const runAction = async (action) => {
         if (busy !== null) return
-        if (action === 'ack') { onDismiss(); return }
+        /**
+         * `ack`（知道了）也要发到 Host。
+         *
+         * 早先这里直接 `onDismiss()` 就返回，只在本地 React state 里收起。
+         * 后果：刷新页面、重启 DSH 之后那条水印又回来——因为 Host 的
+         * guard.json 里它一直在，每次加载都会重新下发。用户看到的就是
+         * 「点了知道了没用，下次打开还在」。
+         *
+         * 现在带上 `revision`，Host 落盘 ackedRevision，此后不再发布它；
+         * 水印内容一变（新告警）revision 抬高，自动复位。
+         */
         setBusy(action)
         setFailed(null)
         try {
           const res = await fetch(ACTION_URL, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ action }),
+            body: JSON.stringify(action === 'ack' ? { action, revision } : { action }),
           })
           const payload = await res.json().catch(() => ({}))
+          /**
+           * ack 的失败不该挡住本地收起：用户已经点了，界面必须响应。
+           * Host 那边没记上的话，最坏是下次刷新再出现一次，比卡住强。
+           */
+          if (action === 'ack') {
+            onDismiss()
+            return
+          }
           if (!res.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${res.status}`)
           /**
            * Host 明确回报「没停用成功」时，**不能**把它当成处理完。
