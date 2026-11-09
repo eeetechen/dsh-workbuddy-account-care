@@ -5,3 +5,6 @@ tmp/
 *.tmp-*
 dist/
 *.tgz
+
+# 需求文档只在本地，不进版本库
+docs/需求.md
