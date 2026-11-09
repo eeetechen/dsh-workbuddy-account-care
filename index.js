@@ -342,6 +342,14 @@ async function readGuardState() {
        * 正是用户报的那个 bug。
        */
       ackedRevision: Number.isFinite(parsed?.ackedRevision) ? parsed.ackedRevision : null,
+      /**
+       * 这次 ack 是否要求**永久压住**这条水印。
+       *
+       * 由客户端在 POST 时判断后带上来——只有它知道「有没有后台 wb 会话」
+       * （宿主拿不到 `retainedBy.mainView`，分辨不出用户正在看哪个会话）。
+       * 缺省 `null` = 老客户端/手工调用，退回 Host 自己的形态判断。
+       */
+      ackSuppress: typeof parsed?.ackSuppress === 'boolean' ? parsed.ackSuppress : null,
     }
   } catch (error) {
     return {
@@ -410,6 +418,22 @@ function staleReason(watermark) {
   if (isStaleUntilRestart(watermark)) return 'until-restart-elapsed'
   if (isLegacyRestartWatermark(watermark)) return 'legacy-upgrade-watermark'
   return null
+}
+
+/**
+ * 这条水印点了「知道了」之后，能不能**永久压住**（活到 revision 变化为止）。
+ *
+ * 只有升级通知可以。判据用 `dismissible` / `untilRestart`——这两个字段是
+ * 升级通知专有的（见 `pushUpgradeWatermark`），危险告警永远不会带。
+ *
+ * 危险告警与它的收尾水印走另一条语义：需求 3 的「点了之后消失，再重现」，
+ * 是**强提醒**，必须继续下发，否则客户端 1.8 秒后重新浮出来的只是本地旧副本，
+ * 下一次同步就被撤掉了。真正的关闭条件有两个，都不在这里：
+ *   · 用户选了「软结束 / 硬结束」→ `finalizeWatermark` 改写水印
+ *   · 切到非 wb provider → 客户端门控关上，卡片不渲染
+ */
+function isSuppressibleAck(watermark) {
+  return watermark?.dismissible === true || watermark?.untilRestart === true
 }
 
 /**
@@ -859,8 +883,15 @@ export function apply(ctx, config = {}) {
      */
     if (action === 'ack') {
       const revision = Number(body.revision)
+      /**
+       * 客户端自己算「这次收起是不是永久的」，随 ack 一起带上来。
+       *
+       * 它才知道有没有后台 wb 会话（宿主拿不到 `retainedBy.mainView`）。
+       * 只接受布尔值，其它一律当没给，退回 Host 按水印形态判断。
+       */
+      const suppress = typeof body.suppress === 'boolean' ? body.suppress : undefined
       try {
-        await ackWatermark(Number.isFinite(revision) ? revision : null)
+        await ackWatermark(Number.isFinite(revision) ? revision : null, suppress)
       } catch (error) {
         logger.error?.(`[workbuddy-guard] 记录「知道了」失败: ${String(error?.message || error)}`)
         return send(500, { ok: false, action, error: 'ack-failed' })
@@ -1283,25 +1314,44 @@ export function apply(ctx, config = {}) {
    *
    * `revision` 传 null 时按「当前水印的 revision」处理——客户端老版本没带
    * 这个字段时也不至于记不住。
+   *
+   * `suppress` 由客户端判断后带上来：只有它知道「有没有后台 wb 会话」。
+   * 传 `undefined`（老客户端、手工 curl）时退回按水印形态判断。
    */
-  async function ackWatermark(revision) {
+  async function ackWatermark(revision, suppress) {
     const file = guardFile()
     let snapshot
     try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
     const target = Number.isFinite(revision) ? revision : Number(snapshot.revision) || 0
+    /**
+     * 这一次 ack 到底要不要**永久压住**这条水印。
+     *
+     * 判断权在客户端：`isPending && !hasBackground`（待确认但没有后台会话）
+     * 这种情况需求要求「点了之后消失」，而宿主分辨不出来——它没有
+     * `retainedBy.mainView`，只会把自己的会话也算成后台，于是永远 busy。
+     * 客户端带上结论，这里照做即可；没带就按形态兜底。
+     */
+    const shouldSuppress = typeof suppress === 'boolean'
+      ? suppress
+      : isSuppressibleAck(snapshot.watermark)
     snapshot.ackedRevision = target
     snapshot.ackedAt = new Date().toISOString()
+    snapshot.ackSuppress = shouldSuppress
     const tmp = `${file}.tmp-${process.pid}`
     await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
     await rename(tmp, file)
     /**
-     * 立刻把内存里的 `current` 也清掉，不等下一轮 poll。
-     *
+     * 要永久压住时，立刻把内存里的 `current` 也清掉，不等下一轮 poll。
      * 否则用户点完「知道了」，卡片虽然本地收起了，只要页面一刷新，
      * Host 又会把同一条下发一次（因为 `current` 还停在旧值）。
+     *
+     * 不压住（危险告警的强提醒）时**不能清**：那 1.8 秒后重新浮出来的
+     * 就只是一份本地旧副本，下一次轮询就把它撤掉了。
      */
-    current = { ...current, watermark: null }
-    logger.warn?.(`[workbuddy-guard] 用户确认了水印 revision ${target}，不再显示`)
+    if (shouldSuppress) {
+      current = { ...current, watermark: null }
+    }
+    logger.warn?.(`[workbuddy-guard] 用户确认了水印 revision ${target}，${shouldSuppress ? '不再显示' : '仍会继续提醒'}`)
   }
 
   /** 执行一条升级指令，把结果写回 guard.json 供下一轮与 `--status` 读取。 */
@@ -1444,12 +1494,33 @@ export function apply(ctx, config = {}) {
     const state = await clearStaleOnce(await readGuardState())
 
     /**
-     * 用户已经点过「知道了」的那条，不再发布。
+     * 用户已经点过「知道了」的那条，还要不要继续发布？
      *
      * 判据是 revision 相等：水印内容一变，revision 就被抬高，这里自动失效，
      * 新提示照常出现。所以不需要清理 `ackedRevision`，也不需要定时器。
+     *
+     * **但不是所有形态都该被 ack 压住。**「知道了」在需求里是两种语义：
+     *
+     *   · 升级通知（`dismissible` / `untilRestart`）——需求 2 明确
+     *     「点击之后直接消失」，点了就该永久压住（活到 revision 变化为止）。
+     *   · 危险告警与它的收尾水印——需求 3 明确「点了之后消失，再重现」，
+     *     是个**强提醒**：只要还在用 WorkBuddy，它就该反复出现，直到用户
+     *     真的选「软结束 / 硬结束」，或者切到非 wb provider 让门控关上。
+     *
+     * 早先这里对所有形态一视同仁地压住，于是需求 3 的强提醒名存实亡：
+     * 客户端 `onDismiss` 按 `permanent` 判据打算 1.8 秒后重新浮出来，
+     * 可 Host 已经不再下发同一条，于是卡片闪一下就被撤掉了——用户看到
+     * 「点了知道了，卡片自己闪了一下就没了」，既不像消失也不像提醒。
+     *
+     * 判断权优先交给客户端（它才知道有没有后台会话）：ack 时带上的
+     * `ackSuppress` 就是那次判断的结论。没带（老客户端、手工 curl）时
+     * 才退回按水印形态判断。
      */
-    const acked = state.watermark !== null
+    const suppressible = typeof state.ackSuppress === 'boolean'
+      ? state.ackSuppress
+      : isSuppressibleAck(state.watermark)
+    const acked = suppressible
+      && state.watermark !== null
       && state.watermark !== undefined
       && Number(state.ackedRevision) === Number(state.revision)
     const effectiveWatermark = acked ? null : state.watermark

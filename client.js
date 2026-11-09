@@ -457,33 +457,38 @@ window.__ModuleLoader__.load({
         '--wbg-ink': 'color-mix(in srgb, var(--wbg-accent) 72%, var(--dsw-alias-label-primary, #111111))',
       }
 
+      /**
+       * 「这一次点知道了，是不是就此永久收起？」
+       *
+       * 判据必须和 Host 的 `isSuppressibleAck` 对齐，否则两边各判一次、
+       * 结果不一致就会露馅（一边收起、另一边继续下发 → 卡片闪一下又回来，
+       * 或者该强提醒的再也不出现）。
+       *
+       *   永久收起 —— 这条提示的使命已经完成，再弹只会烦人：
+       *     · 升级通知（`dismissible` 热生效 / `untilRestart` 要重启）——
+       *       需求 2「点击之后直接消失」
+       *     · 待确认、但**没有**后台 wb 会话（两按钮「关闭插件 / 知道了」）：
+       *       需求第 19 行「点了之后消失」——没有任何正在跑的东西要提醒，
+       *       用户看过就够了
+       *
+       *   消失再重现 —— 强提醒，风险还在：
+       *     · 待确认、且有后台 wb 会话（三按钮，需求第 15 行）
+       *     · 已关闭后又被强行打开、正在用 wb（需求第 28 行
+       *       「点了之后消失，再重现。切换到非 wb provider 后水印消失」）
+       *
+       * 插件已经关闭的情况**不在这里处理**：那种状态下门控直接不放行
+       * （需求第 18 行「关闭插件…水印消失」），卡片压根不渲染，
+       * 也就不需要「点掉」这个动作。
+       */
+      const isPermanentDismiss = () => watermark?.dismissible === true
+        || watermark?.untilRestart === true
+        || (isPending && !hasBackground)
+
       const onDismiss = () => {
         setLeaving(true)
         leaveTimer.current = setTimeout(() => {
           setLeaving(false)
-          /**
-           * 「知道了」有**两种**语义，按当前形态决定（需求 3）：
-           *
-           *   永久收起 —— 这条提示的使命已经完成，再弹只会烦人：
-           *     · 升级通知（`dismissible`）
-           *     · 待确认、但没有后台 wb 会话（两按钮「关闭插件 / 知道了」）：
-           *       需求第 19 行「点了之后消失」——没有任何正在跑的东西要提醒，
-           *       用户看过就够了
-           *
-           *   消失再重现 —— 强提醒，风险还在：
-           *     · 待确认、且有后台 wb 会话（三按钮，需求第 15 行）
-           *     · 已关闭后又被强行打开、正在用 wb（需求第 28 行
-           *       「点了之后消失，再重现。切换到非 wb provider 后水印消失」）
-           *
-           * 插件已经关闭的情况**不在这里处理**：那种状态下门控直接不放行
-           * （需求第 18 行「关闭插件…水印消失」），卡片压根不渲染，
-           * 也就不需要「点掉」这个动作。
-           *
-           * 之前一律用「收起 1.8 秒再浮出」，于是插件关掉后那条收尾水印
-           * 怎么点都回来，看起来像点不掉。
-           */
-          const permanent = watermark?.dismissible === true
-            || (isPending && !hasBackground)
+          const permanent = isPermanentDismiss()
           if (permanent) {
             // 绑在 revision 上：将来 revision 一变（新一次告警）自然复位
             setFinishedRevision(revision)
@@ -521,10 +526,17 @@ window.__ModuleLoader__.load({
         setBusy(action)
         setFailed(null)
         try {
+          /**
+           * ack 额外带一个 `suppress`：这次点「知道了」，是就此永久收起，
+           * 还是过一会儿还要再提醒？判断只能在这里做——有没有后台 wb 会话
+           * 是客户端才知道的信息，宿主分辨不出来（它没有 `retainedBy.mainView`）。
+           * Host 拿到后原样信任，不再自己猜一遍。
+           */
+          const suppress = action === 'ack' ? isPermanentDismiss() : undefined
           const res = await fetch(ACTION_URL, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(action === 'ack' ? { action, revision } : { action }),
+            body: JSON.stringify(action === 'ack' ? { action, revision, suppress } : { action }),
           })
           const payload = await res.json().catch(() => ({}))
           /**

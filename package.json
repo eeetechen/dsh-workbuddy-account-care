@@ -34,7 +34,7 @@
     "docs/*.png"
   ],
   "scripts": {
-    "test": "node test/uses-workbuddy.test.mjs && node test/startup-check.test.mjs && node test/schedule-behaviour.test.mjs",
+    "test": "node test/uses-workbuddy.test.mjs && node test/startup-check.test.mjs && node test/schedule-behaviour.test.mjs && node test/ack-shapes.test.mjs",
     "test:e2e": "node test/e2e-startup.test.mjs"
   },
   "engines": {
