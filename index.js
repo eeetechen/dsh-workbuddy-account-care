@@ -32,7 +32,8 @@
  *
  * 代价也要说清楚：默认「插件自带定时」，所以 **DSH 不在跑的时候不检查**。
  * 这在语义上是够的——DSH 没跑就没有任何请求会被发出去。若你仍想要「DSH 关了
- * 也守着」，把 systemd 定时器也装上即可（`npx dsh-workbuddy-account-care install`），
+ * 也守着」，得自己挂一个 systemd timer 去跑 `scripts/watch.mjs`（命令行没有
+ * `install` 子命令，`bin/guard.mjs` 只有 status / where / check）；
  * 两边有 `run.lock` 互斥，不会同时写。
  *
  * 状态文件（默认 `$DSH_HOME/workbuddy-update-watch/guard.json`，脚本写入）：
