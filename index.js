@@ -162,6 +162,15 @@ const ACTION_PATH = '/plugins/dsh-workbuddy-account-care/action'
 /** 软结束之后等会话自己停下来的上限；超时也照样停用，只是把结果记进日志。 */
 const SOFT_WAIT_MS = 120_000
 
+/**
+ * 用户点「稍后」之后，隔多久再弹「有新版本，要升级吗」，毫秒。
+ *
+ * 为什么必须重弹而不是永久收起：不升级意味着**旧 connect 面对新 WB**——
+ * 那正是本插件要防的风险窗口。用户点「稍后」多半是「现在正忙」，不是
+ * 「永远别升」。30 分钟够他忙完一件事，又不至于让风险窗口敞太久。
+ */
+const UPGRADE_GATE_SNOOZE_MS = 30 * 60_000
+
 function resolveDshHome() {
   return process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
 }
@@ -350,6 +359,17 @@ async function readGuardState() {
        * 缺省 `null` = 老客户端/手工调用，退回 Host 自己的形态判断。
        */
       ackSuppress: typeof parsed?.ackSuppress === 'boolean' ? parsed.ackSuppress : null,
+      /**
+       * 用户对「这条升级指令」的批准状态。
+       *
+       * `{ revision, approved, approvedAt }`。只有 Desktop + 有会话在跑时才会
+       * 用到——那种场景下升级前要先问一句，用户点了「立即升级」才动手。
+       * 按 revision 绑定：升级指令一换，旧的批准自动失效，不会把「上次点的
+       * 同意」当成「这次也同意」。
+       */
+      upgradeGate: parsed?.upgradeGate ?? null,
+      /** 用户点了「稍后」时记下的时间点；早于现在就当没推迟过。 */
+      upgradeSnoozeUntil: typeof parsed?.upgradeSnoozeUntil === 'string' ? parsed.upgradeSnoozeUntil : null,
     }
   } catch (error) {
     return {
@@ -510,8 +530,48 @@ const DEFAULT_STOP_TEXT = '本机 provider 已更新，本条消息由监控插�
  *
  * 用正文里的一个稳定片段而不是额外加前缀——正文就是用户要看到的样子，
  * 不该为了机器识别再挂一个 `[workbuddy-guard]` 之类的标签。
+ *
+ * **必须比共用的那半句更具体。** 现在有三条消息都带
+ * 「本条消息由监控插件自动发送」（软结束 / 升级暂停 / 升级恢复），如果这里
+ * 只认那半句，收件箱里只要躺过一条暂停消息，真正的软结束就会被当成
+ * 「已经停过了」跳过——而那恰恰是唯一要紧的那条（WB 变了、可能封号）。
+ * 所以这里认 `DEFAULT_STOP_TEXT` 独有的那句。
  */
-const SOFT_STOP_MARKER = '本条消息由监控插件自动发送'
+const SOFT_STOP_MARKER = '收到后暂停你的所有任务'
+
+/**
+ * 升级完成的常量（升级前暂停那一步见 `pauseForUpgrade`）。
+ *
+ * 这句是给**下一轮的那个 agent** 看的：它得知道现在可以接着干了、刚才为什么
+ * 被打断、以及这条消息不是用户本人写的。
+ *
+ * 与 `DEFAULT_STOP_TEXT` 分开：那句说的是「本机 provider 已更新」——WB 客户端
+ * 换了版本，后果是可能封号，语气要重。升级 connect 是例行维护，两件事混用
+ * 同一句话，用户回看会话记录分不清哪次是危险告警。
+ */
+const DEFAULT_RESUME_TEXT = '本机 provider 已升级完成，本条消息由监控插件自动发送，'
+  + '请继续之前未完成的任务，无需重复已经做完的部分'
+
+/**
+ * 恢复消息的去重标记。
+ *
+ * 与 `SOFT_STOP_MARKER` / `PAUSE_MARKER` 三者互不包含：三条消息共用
+ * 「本条消息由监控插件自动发送」那半句，所以去重必须认各自独有的部分，
+ * 否则「升级前暂停过」会挡掉「升级后继续」。
+ */
+const RESUME_MARKER = '请继续之前未完成的任务'
+
+/**
+ * 升级前暂停消息的正文（默认）。
+ *
+ * 「保存当前进度」是这句里最要紧的部分：`cancel` 会丢掉在飞的助手轮次，
+ * 提醒它先把做完的事落下来，比只说「暂停」有用。
+ */
+const DEFAULT_PAUSE_TEXT = '本机 provider 即将升级，本条消息由监控插件自动发送，'
+  + '升级期间插件会短暂不可用。请立刻保存当前进度并停下正在做的事，升级完成后会自动通知你继续'
+
+/** 暂停消息的去重标记；与恢复消息分开，见 `RESUME_MARKER`。 */
+const PAUSE_MARKER = '即将升级'
 
 /**
  * 日志里最后一条 assistant 消息是谁生成的（只用于降级判定，见下）。
@@ -899,6 +959,25 @@ export function apply(ctx, config = {}) {
       return send(200, { ok: true, action })
     }
     /**
+     * `upgrade-now` / `upgrade-later` —— 升级确认卡片上的两个选择。
+     *
+     * 必须在 `action !== 'soft' …` 那道校验**之前**处理掉，否则会被当成
+     * 未知动作打回 400。它们也不该走 `runAction`（那条路径是停用 bundle）。
+     */
+    if (action === 'upgrade-now' || action === 'upgrade-later') {
+      if (actionInFlight !== null) return send(409, { ok: false, error: 'busy', action: actionInFlight })
+      actionInFlight = action
+      try {
+        const result = await handleUpgradeGate(action)
+        return send(200, { ok: true, action, ...(result ?? {}) })
+      } catch (error) {
+        logger.error?.(`[workbuddy-guard] 升级确认 ${action} 失败: ${error?.message || error}`)
+        return send(500, { ok: false, action, error: String(error?.message || error) })
+      } finally {
+        actionInFlight = null
+      }
+    }
+    /**
      * `close` 与 `hard` 是同一个动作的两个名字。
      *
      * 需求 3 要求两种形态：有后台会话时给「硬结束」，没有时给「关闭插件」。
@@ -990,6 +1069,15 @@ export function apply(ctx, config = {}) {
     const skipped = []
     const agents = ctx.agents?.list?.() ?? []
     if (agents.length === 0) return { stopped, skipped, note: 'no-live-agents' }
+    /**
+     * 去重标记按**文案本身**挑，不能一律用 `SOFT_STOP_MARKER`。
+     *
+     * 三条消息（软结束 / 升级暂停 / 升级恢复）都含那句
+     * 「本条消息由监控插件自动发送」，只认它的话：收件箱里已经有一条恢复
+     * 消息时，升级前的暂停会被当成「已经停过了」而跳过——会话根本没停，
+     * 装包照样把它打断。所以这里认各自更具体的片段。
+     */
+    const marker = text.includes(PAUSE_MARKER) ? PAUSE_MARKER : SOFT_STOP_MARKER
     for (const agent of agents) {
       // 单个会话出问题不能带走整批：每个都独立兜底
       try {
@@ -1001,17 +1089,22 @@ export function apply(ctx, config = {}) {
           skipped.push({ sessionId: agent.id, model, status })
           continue
         }
-        // 已经软结束过就不再重复插一条，否则每轮检查都会堆满收件箱
+        // 已经说过就不再重复插，否则每轮检查都会堆满收件箱
         const inboxText = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])]
           .map((m) => textOf(m.content))
           .join('\n')
-        if (inboxText.includes(SOFT_STOP_MARKER)) {
+        if (inboxText.includes(marker)) {
           skipped.push({ sessionId: agent.id, model, status, already: true })
           continue
         }
         softStop(agent, reason, text)
         stopped.push({ sessionId: agent.id, model })
-        logger.warn?.(`[workbuddy-guard] 软结束会话 ${agent.id}（${model}）`)
+        /**
+         * 日志措辞保持中性：这个函数现在既服务于「软结束」（WB 变了）也服务于
+         * 「升级前暂停」（例行维护）。写成「软结束会话」会让升级那条路径的
+         * 日志读起来像触发了封号告警。
+         */
+        logger.warn?.(`[workbuddy-guard] 已向会话 ${agent.id}（${model}）发送暂停通知`)
       } catch (error) {
         skipped.push({ sessionId: agent.id, error: String(error?.message || error) })
         logger.error?.(`[workbuddy-guard] 软结束 ${agent.id} 失败: ${String(error?.message || error)}`)
@@ -1245,7 +1338,8 @@ export function apply(ctx, config = {}) {
      *
      * 判据用 `dismissible` / `untilRestart`（升级通知专有字段）。
      */
-    const isUpgradeNotice = watermark.dismissible === true || watermark.untilRestart === true
+    const isUpgradeNotice = watermark.dismissible === true
+      || watermark.untilRestart === true
     /**
      * **插件已经关了就别再给「关闭插件 / 硬结束」按钮。**
      *
@@ -1256,13 +1350,22 @@ export function apply(ctx, config = {}) {
      * `=== null`（读不到状态）时保持原行为，不要因为读不到就把按钮藏了。
      */
     const closed = bundleEnabled === false
-    const actions = isUpgradeNotice
-      ? ['ack']
-      : closed
+    /**
+     * 升级确认卡片（`upgradeGate`）的按钮由**写入方**决定，宿主要原样保留——
+     * 它既不是「等你决定要不要关插件」的红牌，也不该被改写成 `['ack']`。
+     * 单独判一次，而不是并进 `isUpgradeNotice` 的分支里，因为那个分支的
+     * 语义就是「只能点知道了」。
+     */
+    const gated = watermark.upgradeGate !== undefined
+    const actions = gated
+      ? (Array.isArray(watermark.actions) ? watermark.actions : ['upgrade-now', 'upgrade-later'])
+      : isUpgradeNotice
         ? ['ack']
-        : ((!isPending || handled)
-            ? ['close', 'ack']
-            : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
+        : closed
+          ? ['ack']
+          : ((!isPending || handled)
+              ? ['close', 'ack']
+              : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
     const same = Array.isArray(watermark.actions)
       && watermark.actions.length === actions.length
       && watermark.actions.every((a, i) => a === actions[i])
@@ -1288,6 +1391,151 @@ export function apply(ctx, config = {}) {
    * 早先正是把它当权威、还只在 revision 变化时重算，才导致
    * 「没有后台任务却显示软结束/硬结束」。
    */
+  /**
+   * 把所有**正在跑的** wb 会话找出来（前台后台都算）。
+   *
+   * 与 `hasBackgroundWorkbuddySession()` 的区别是刻意的：那个函数排掉了
+   * 「用户正在看的那个会话」，用来决定按钮组合；而这里要的是「升级会让
+   * 哪些会话断掉」——前台那个当然也会断，不能漏。
+   *
+   * 返回 `[{ id, model, status }]`，`status` 保留原值供调用方判断。
+   */
+  function runningWorkbuddySessions() {
+    const out = []
+    const agents = ctx.agents?.list?.() ?? []
+    for (const agent of agents) {
+      try {
+        const projections = ctx.get('sessionProjections')?.snapshot(agent.session)?.values
+        const model = usesWorkbuddy(agent, projections)
+        if (model === null) continue
+        out.push({ id: agent.id, model, status: agent.status })
+      } catch { /* 单条读不出来就跳过，别让一条坏会话挡住整批 */ }
+    }
+    return out
+  }
+
+  /**
+   * 这台宿主是不是 DSH Desktop（Electron）。
+   *
+   * 为什么这件事决定要不要「先暂停会话」：Desktop 的升级走
+   * `pluginManager.updateBundle()`，而它在源码里是
+   * **先 `removeBundle` 再 `installBundle`** 两步。中间那段时间
+   * `node_modules/dsh-connect-workbuddy` 在磁盘上根本不存在——实测拍到的
+   * 就是这一刻脚本报 `{"mode":"skipped","reason":"target-not-installed"}`。
+   *
+   * npm / `dsh plugin add` 那条路是「先装新版本、再切目录」，没有这个空窗，
+   * 所以只有 Desktop 需要先让会话停下来。
+   *
+   * 判据有意写得宽：Electron 会把 `process.versions.electron` 注入主进程、
+   * 渲染进程和 utility 进程，直接看它最准；再兜一层 argv 里有没有
+   * `dsh-desktop-host`，防止某些打包方式把 versions 藏起来。
+   */
+  function isDesktopHost() {
+    try {
+      if (process.versions?.electron) return true
+      const blob = [...(process.execArgv ?? []), ...(process.argv ?? [])].join(' ')
+      return blob.includes('dsh-desktop-host')
+    } catch { return false }
+  }
+
+  /**
+   * 这次升级要不要先问问用户。
+   *
+   * 三个条件同时成立才拦：
+   *   · Desktop（有 remove → install 空窗）
+   *   · 确实有 wb 会话在跑（否则没东西会被打断，静默升就行了）
+   *   · 用户还没批准过这一条升级指令
+   *
+   * 返回 `{ gate, sessions, snoozed }`，调用方据此决定「弹窗」「静默升」还是
+   * 「再等等」。
+   */
+  function upgradeGateFor(state, upgrade) {
+    const sessions = runningWorkbuddySessions()
+    const live = sessions.filter((s) => s.status === 'running')
+    if (!isDesktopHost() || live.length === 0) {
+      return { gate: false, sessions, live, snoozed: false }
+    }
+    const revision = Number(upgrade.revision) || 0
+    const gate = state.upgradeGate
+    if (gate && Number(gate.revision) === revision && gate.approved === true) {
+      // 用户已经点了「立即升级」，放行
+      return { gate: false, sessions, live, snoozed: false, approved: true }
+    }
+    const until = Date.parse(String(state.upgradeSnoozeUntil ?? ''))
+    if (Number.isFinite(until) && until > Date.now()) {
+      return { gate: false, sessions, live, snoozed: true, until }
+    }
+    return { gate: true, sessions, live, snoozed: false }
+  }
+
+  /**
+   * 升级前把正在跑的 wb 会话停下来——**直接复用软结束那一套**。
+   *
+   * 形状与 `runAction('soft')` 完全一致，只是把最后一步「停用 bundle」换成
+   * 「装包」：
+   *
+   *     stopWorkbuddySessions(原因, 文案)   // 插队一条说明，再 cancel 当前轮
+   *     waitForWorkbuddyIdle(SOFT_WAIT_MS)  // 等它真的停下来
+   *
+   * 曾经在这里另造过一个「只 cancel、不发消息」的版本，理由是 `followup`
+   * 会立刻起一轮新请求、撞上 remove → install 的空窗。那个理由站不住：
+   * 紧接着的 `waitForWorkbuddyIdle` 就在**装包之前**等那一轮跑完，请求发生在
+   * 包还在的时候。而不发消息的代价是会话被无声中断——用户看到一轮莫名中止，
+   * 再接一句没头没尾的「请继续」，本次升级对它而言就只剩「丢了工作」。
+   *
+   * 文案与软结束分开（`DEFAULT_PAUSE_TEXT` vs `DEFAULT_STOP_TEXT`）：软结束
+   * 说的是「WB 变了，别再用旧 connect」（可能封号），这里是例行维护。
+   */
+  async function pauseForUpgrade(reason) {
+    let stopped = []
+    try {
+      stopped = stopWorkbuddySessions(reason, DEFAULT_PAUSE_TEXT).stopped
+    } catch (error) {
+      logger.error?.(`[workbuddy-guard] 升级前暂停失败: ${error?.message || error}`)
+    }
+    const idle = await waitForWorkbuddyIdle(SOFT_WAIT_MS)
+    logger.warn?.(`[workbuddy-guard] 升级前暂停：停止 ${stopped.length} 个会话，idle=${idle.idle}`)
+    return { paused: stopped.map((s) => s.sessionId), idle }
+  }
+
+  /**
+   * 升级完成后把刚才停下的会话接回去。
+   *
+   * 只发给**我们真的停过**的那些会话：升级期间用户可能新开了一个，那个不该
+   * 收到「继续未完成的任务」——它压根没有未完成的任务。
+   *
+   * 失败不抛：一个会话接不回去不该挡住其它会话，也不该把升级结果标成失败。
+   */
+  function resumeAfterUpgrade(sessionIds, to) {
+    const resumed = []
+    for (const id of sessionIds) {
+      const agent = ctx.agents?.get?.(id)
+      if (!agent) {
+        logger.warn?.(`[workbuddy-guard] 恢复会话 ${id} 跳过：会话已不在`)
+        continue
+      }
+      try {
+        const inboxText = [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])]
+          .map((m) => textOf(m.content))
+          .join('\n')
+        if (inboxText.includes(RESUME_MARKER)) continue
+        agent.followup({
+          id: `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+          role: 'user',
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: `${DEFAULT_RESUME_TEXT}（新版本 ${to}）` }],
+        })
+        resumed.push(id)
+      } catch (error) {
+        logger.error?.(`[workbuddy-guard] 恢复会话 ${id} 失败: ${error?.message || error}`)
+      }
+    }
+    if (resumed.length > 0) {
+      logger.warn?.(`[workbuddy-guard] 已恢复 ${resumed.length} 个会话继续未完成的任务`)
+    }
+    return resumed
+  }
+
   function hasBackgroundWorkbuddySession() {
     try {
       const agents = ctx.agents?.list?.() ?? []
@@ -1300,6 +1548,107 @@ export function apply(ctx, config = {}) {
       }
       return false
     } catch { return true }
+  }
+
+  /**
+   * 升级前弹的那张「要升级了，现在升吗」的水印。
+   *
+   * 与 `pushUpgradeWatermark`（升级**之后**的通知）是两件事，刻意分开：
+   *   · 这一张是**问句**，带 `upgradeGate` 标记，按钮是「立即升级 / 稍后」；
+   *   · 那一张是**陈述句**，带 `dismissible`，按钮只有「知道了」。
+   *
+   * `level: 'warning'` 而不是 danger：这不是风险告警，是一次需要你让路的
+   * 例行维护。用红色会让用户以为 WB 又炸了。
+   */
+  async function pushUpgradeGateWatermark(upgrade, liveSessions) {
+    const file = guardFile()
+    let snapshot
+    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
+    const running = liveSessions.length
+    snapshot.watermark = {
+      level: 'warning',
+      title: '插件有新版本',
+      body: `本机有 ${running} 个会话正在用 WorkBuddy。`
+        + '升级过程中插件会短暂不可用，需要先把它们暂停，装好后再自动继续。',
+      detail: `${GUARDED_BUNDLE} ${upgrade.from ?? '?'} → ${upgrade.to ?? '?'}`,
+      ...(upgrade.from === undefined ? {} : { from: upgrade.from }),
+      ...(upgrade.to === undefined ? {} : { to: upgrade.to }),
+      pendingDisable: false,
+      /**
+       * `upgradeGate` 是这张卡片的身份标记。客户端据此把按钮换成
+       * 「立即升级 / 稍后」，而不是套用危险告警的软结束/硬结束。
+       */
+      upgradeGate: { revision: Number(upgrade.revision) || 0, to: upgrade.to ?? null },
+      actions: ['upgrade-now', 'upgrade-later'],
+      /**
+       * **不许被「知道了」压住。** 这张卡片要的是一个决定，不是一个确认；
+       * 用户没决定之前它该一直问下去（以及 30 分钟后再问一次）。
+       */
+      at: new Date().toISOString(),
+    }
+    snapshot.revision = (Number(snapshot.revision) || 0) + 1
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+    await rename(tmp, file)
+    publishedWatermarkRevision = snapshot.revision
+    current = {
+      watermark: snapshot.watermark,
+      revision: snapshot.revision,
+      guardFile: file,
+      bundleEnabled: current.bundleEnabled ?? null,
+    }
+    logger.warn?.(`[workbuddy-guard] 已挂升级确认水印 revision ${snapshot.revision}`
+      + `（${upgrade.from ?? '?'} → ${upgrade.to ?? '?'}，${running} 个会话在跑）`)
+  }
+
+  /**
+   * 用户对升级确认卡片的选择。
+   *
+   * `upgrade-now`：写 `upgradeGate.approved`，下一轮 poll 就会带着这个批准
+   * 进入 `runUpgrade`（暂停 → 升级 → 恢复）。**不清 `handledUpgradeRevision`**
+   * ——那里本来就还没推进过。
+   *
+   * `upgrade-later`：写 `upgradeSnoozeUntil`，`upgradeGateFor` 在到期前
+   * 一律返回 `snoozed`，于是既不升级也不弹窗。到期后自动重新问。
+   */
+  async function handleUpgradeGate(decision) {
+    const file = guardFile()
+    let snapshot
+    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return null }
+    const revision = Number(snapshot.upgrade?.revision) || 0
+    if (decision === 'upgrade-now') {
+      snapshot.upgradeGate = {
+        revision,
+        approved: true,
+        approvedAt: new Date().toISOString(),
+      }
+      delete snapshot.upgradeSnoozeUntil
+    } else {
+      const until = new Date(Date.now() + UPGRADE_GATE_SNOOZE_MS).toISOString()
+      snapshot.upgradeSnoozeUntil = until
+      snapshot.upgradeGate = { revision, approved: false, snoozedAt: new Date().toISOString() }
+    }
+    /**
+     * 顺手把这张卡片收掉：无论同意还是推迟，问题都已经问过了。
+     * `runUpgrade` 成功后会挂另一张「已升级」的卡，`snoozed` 时则安静
+     * 到点再问——两种情况下都不该留着这张问句。
+     */
+    snapshot.watermark = null
+    snapshot.revision = (Number(snapshot.revision) || 0) + 1
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { mode: 0o600 })
+    await rename(tmp, file)
+    publishedWatermarkRevision = snapshot.revision
+    current = { ...current, watermark: null, revision: snapshot.revision }
+    /**
+     * 卡片被收掉了，`gateCardRevision` 要跟着清——否则「稍后」推到 30 分钟
+     * 后到期时，`gateCardRevision` 仍等于当前 revision，重弹会被去重挡掉。
+     * 这正是上面那个 bug 的另一半。
+     */
+    gateCardRevision = null
+    snoozeLogged = null
+    logger.warn?.(`[workbuddy-guard] 升级确认：${decision === 'upgrade-now' ? '立即升级' : '稍后'}`)
+    return { ok: true, decision }
   }
 
   /**
@@ -1354,11 +1703,35 @@ export function apply(ctx, config = {}) {
     logger.warn?.(`[workbuddy-guard] 用户确认了水印 revision ${target}，${shouldSuppress ? '不再显示' : '仍会继续提醒'}`)
   }
 
+  /** 已经挂过升级确认卡片的 revision，避免每 2 秒重挂同一张。 */
+  let gateCardRevision = null
+  /** 推迟日志的键（`revision@until`）；到期后键变了会再记一条。 */
+  let snoozeLogged = null
+
   /** 执行一条升级指令，把结果写回 guard.json 供下一轮与 `--status` 读取。 */
   async function runUpgrade(state, request) {
     const spec = String(request.spec ?? `${GUARDED_BUNDLE}@${request.to}`)
     const upgrader = resolveUpgrader()
     logger.warn?.(`[workbuddy-guard] 开始升级 ${spec}（方式：${upgrader.label}）`)
+
+    /**
+     * **先让会话让开，再动磁盘。**
+     *
+     * 这是本次需求的核心：Desktop 的 `updateBundle()` 是 remove → install
+     * 两步，中间 `node_modules/dsh-connect-workbuddy` 真的不存在。正在跑的
+     * wb 会话如果那一刻正好发请求，就是一次注定失败的调用——任务断掉、
+     * 用户还得手动说「继续」。
+     *
+     * 只有 Desktop + 真的有人在跑时才暂停。npm/CLI 那条路没有空窗，
+     * 没有会话在跑时也没东西可停。
+     */
+    let paused = null
+    const live = runningWorkbuddySessions().filter((s) => s.status === 'running')
+    if (isDesktopHost() && live.length > 0) {
+      logger.warn?.(`[workbuddy-guard] Desktop 升级前暂停 ${live.length} 个 wb 会话`)
+      paused = await pauseForUpgrade(`dsh-connect-workbuddy 升级到 ${request.to}`)
+    }
+
     let outcome
     try {
       outcome = await runOutsideHmr(ctx, () => upgrader.run(spec))
@@ -1375,8 +1748,40 @@ export function apply(ctx, config = {}) {
       at: new Date().toISOString(),
       application: outcome.application ?? null,
       restart: outcome.restart === true,
+      ...(paused === null ? {} : { pausedSessions: paused.paused }),
       ...(outcome.error ? { error: outcome.error } : {}),
     })
+
+    /**
+     * **无论升级成没成功，都要把会话接回去。**
+     *
+     * 失败时更需要：用户的任务被我们停掉了，如果不接回去，他面对的是一个
+     * 静默卡住的会话——比升级失败本身更糟。恢复消息里说明新版本号，失败时
+     * 那个版本其实没装成，但 agent 仍能用旧 connect 继续跑（它刚刚还在跑），
+     * 所以「继续」这个动作本身总是成立的。
+     */
+    if (paused !== null && paused.paused.length > 0) {
+      /**
+       * **恢复失败不能吃掉升级水印。**
+       *
+       * 这里原本是裸调用。`resumeAfterUpgrade` 内部逐条 try/catch，但循环体
+       * 开头那句 `ctx.agents?.get?.(id)` 在 try **外面**——它一旦抛（服务已
+       * 卸载、get 被替换等），整个 `runUpgrade` 就中断，下面的
+       * `pushUpgradeWatermark` 再也走不到。而 `poll()` 的链路用
+       * `.catch(() => {})` 兜底，于是这个异常连日志都不会留一条：用户看到
+       * 的是「升级成功、但什么提示都没有」。
+       *
+       * 会话接不回去是小事，升级结果不留痕是大事——后者让用户以为插件
+       * 没动过他的环境。
+       */
+      try {
+        resumeAfterUpgrade(paused.paused, request.to)
+      } catch (error) {
+        logger.error?.(`[workbuddy-guard] 恢复会话时出错（升级本身已${
+          outcome.ok ? '成功' : '结束'}）: ${String(error?.message || error)}`)
+      }
+    }
+
     if (outcome.ok) {
       logger.warn?.(`[workbuddy-guard] 升级完成：${spec}（${outcome.method}${outcome.restart ? '，需重启生效' : ''}）`)
       /**
@@ -1420,7 +1825,20 @@ export function apply(ctx, config = {}) {
   async function pushUpgradeWatermark({ from, to, restart, method }) {
     const file = guardFile()
     let snapshot
-    try { snapshot = JSON.parse(await readFile(file, 'utf8')) } catch { return }
+    try {
+      snapshot = JSON.parse(await readFile(file, 'utf8'))
+    } catch (error) {
+      /**
+       * **读不到就大声说。**
+       *
+       * 早先这里是 `catch { return }`：升级明明成功了，水印却静默没挂，
+       * 日志里连一句都没有。实机就撞到过「升级成功、界面上什么都没有」，
+       * 而当时完全无从下手——正因为这条路径把唯一的线索也吞了。
+       */
+      logger.error?.(`[workbuddy-guard] 升级成功但读不到状态文件，水印未挂: `
+        + `${String(error?.message || error)}（${file}）`)
+      return
+    }
     /**
      * **不要覆盖一条尚未处理的 WB 红牌。**
      *
@@ -1525,6 +1943,21 @@ export function apply(ctx, config = {}) {
       && Number(state.ackedRevision) === Number(state.revision)
     const effectiveWatermark = acked ? null : state.watermark
 
+    /**
+     * 每次 revision 变化都留一条「读到的 vs 将发布的」。
+     *
+     * 这是为了定位实机那次「升级成功、`/state` 却是 `watermark: null`」——
+     * 当时只有结论没有过程，链条完全断在日志外面，只能靠猜。有了这一行，
+     * 下次同现象出现时能立刻分辨是「磁盘本来就没水印」「被 ack 压住了」
+     * 还是「发布了又被别处清掉」。
+     */
+    if (state.revision !== publishedWatermarkRevision) {
+      logger.info?.(`[workbuddy-guard] 状态 revision ${publishedWatermarkRevision} → ${state.revision}`
+        + `，磁盘水印=${state.watermark === null ? 'null' : JSON.stringify(state.watermark.title)}`
+        + `，acked=${acked}(ackedRevision=${state.ackedRevision}, suppressible=${suppressible})`
+        + `，将发布=${effectiveWatermark === null ? 'null' : JSON.stringify(effectiveWatermark.title)}`)
+    }
+
     // 1) 水印：值变了就重推，没变也要刷新「后台会话 / 插件开关」这类实时字段
     if (state.revision !== publishedWatermarkRevision) {
       publishedWatermarkRevision = state.revision
@@ -1558,8 +1991,44 @@ export function apply(ctx, config = {}) {
     // 1.5) 插件升级指令（脚本只负责「想升到哪」，执行在宿主进程里）
     const upgrade = state.upgrade
     if (upgrade && upgrade.status === 'pending' && Number(upgrade.revision) > handledUpgradeRevision) {
-      handledUpgradeRevision = Number(upgrade.revision)
-      await runUpgrade(state, upgrade)
+      /**
+       * **Desktop + 有会话在跑 → 先问一句。**
+       *
+       * 这里刻意**不**推进 `handledUpgradeRevision`：用户可能一分钟之后才
+       * 点「立即升级」，那一轮还得能进得来。真正防重复的是
+       * `upgradeGate.approved`（批准后 `runUpgrade` 立刻把它消费掉）。
+       */
+      const decision = upgradeGateFor(state, upgrade)
+      /**
+       * 两个**独立**的记忆，不能共用一个变量。
+       *
+       * 早先这里只有一个 `pendingUpgradeGateRevision`，两个分支都往里写：
+       * 用户点「稍后」→ 下一轮进 `snoozed` 分支并把它置成当前 revision →
+       * 30 分钟后推迟到期、重新进 `gate` 分支，`!== revision` 已不成立，
+       * **卡片再也不会弹出来**，升级就那样永久静默了。
+       *
+       * 现在分开：`gateCardRevision` 只在真的挂过卡片时推进，
+       * `snoozeLogged` 记「这一次推迟已经记过日志」，键里带上截止时间，
+       * 到期后键自然不同、日志会再打一条。
+       */
+      if (decision.gate) {
+        if (gateCardRevision !== Number(upgrade.revision)) {
+          gateCardRevision = Number(upgrade.revision)
+          await pushUpgradeGateWatermark(upgrade, decision.live)
+        }
+      } else if (decision.snoozed) {
+        const key = `${upgrade.revision}@${decision.until}`
+        if (snoozeLogged !== key) {
+          snoozeLogged = key
+          logger.warn?.(`[workbuddy-guard] 升级 ${upgrade.from} → ${upgrade.to} 被用户推迟到 `
+            + `${new Date(decision.until).toISOString()}，期间不升级`)
+        }
+      } else {
+        handledUpgradeRevision = Number(upgrade.revision)
+        gateCardRevision = null
+        snoozeLogged = null
+        await runUpgrade(state, upgrade)
+      }
     }
 
     // 2) 软结束会话：指令里带 stopSessions 就执行一次（幂等）

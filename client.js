@@ -366,6 +366,15 @@ window.__ModuleLoader__.load({
       /** 升级通知（带 dismissible / untilRestart）：与 provider、bundle 都无关。 */
       const isUpgradeCard = watermark?.dismissible === true || watermark?.untilRestart === true
       /**
+       * 升级确认卡片（带 `upgradeGate`）：问「现在升级吗」，两个按钮。
+       *
+       * 与上面那张「已升级」的通知区别在于时态：这张是问句、发生在升级**之前**，
+       * 而且只在 Desktop + 有 wb 会话在跑时才出现（宿主决定）。它同样与
+       * provider 选择无关——用户可能刚把会话切走，但那些会话还在后台跑着，
+       * 升级一样会把它们打断。
+       */
+      const isUpgradeGate = watermark?.upgradeGate !== undefined
+      /**
        * 显示门控（需求 3，按阶段区分）：
        *
        *   **待确认**（`pendingDisable`，插件还开着，等你选软结束/硬结束/关闭插件）
@@ -381,7 +390,7 @@ window.__ModuleLoader__.load({
        *
        *   升级通知 → 永远显示（它说的是「我改过你的环境」，与用哪个 provider 无关）。
        */
-      const gateOpen = isUpgradeCard
+      const gateOpen = isUpgradeCard || isUpgradeGate
         ? true
         : bundleClosed
           ? false
@@ -480,8 +489,14 @@ window.__ModuleLoader__.load({
        * （需求第 18 行「关闭插件…水印消失」），卡片压根不渲染，
        * 也就不需要「点掉」这个动作。
        */
+      /**
+       * 升级确认卡片（`upgradeGate`）也当作永久收起：它本来就没有「知道了」，
+       * 万一是老宿主给了 `ack`，说「知道了」等于「先别升」，不该 1.8 秒后
+       * 又弹回来烦人。
+       */
       const isPermanentDismiss = () => watermark?.dismissible === true
         || watermark?.untilRestart === true
+        || isUpgradeGate
         || (isPending && !hasBackground)
 
       const onDismiss = () => {
@@ -547,6 +562,19 @@ window.__ModuleLoader__.load({
             onDismiss()
             return
           }
+          /**
+           * 升级确认的两个按钮：Host 会把卡片收掉并抬高 revision，
+           * 下一轮轮询自然就不再有这张卡。本地只是等它回来，不做乐观收起
+           * ——「现在升级」之后马上会挂「已升级」的通知，中间不能让用户
+           * 看到一帧空白再闪回来。
+           */
+          if (action === 'upgrade-now' || action === 'upgrade-later') {
+            if (!res.ok || payload.ok === false) {
+              throw new Error(payload.error ?? `HTTP ${res.status}`)
+            }
+            setFinishedRevision(revision)
+            return
+          }
           if (!res.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${res.status}`)
           /**
            * Host 明确回报「没停用成功」时，**不能**把它当成处理完。
@@ -599,10 +627,12 @@ window.__ModuleLoader__.load({
             ? ['close', 'ack']
             : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
       /**
-       * 升级类水印保留宿主给的 actions（只有「知道了」），与有没有会话无关。
-       * `isUpgradeCard` 已在门控那段声明过，这里直接复用。
+       * 升级类水印保留宿主给的 actions，与有没有会话无关。
+       *
+       * 「升级确认」（`upgradeGate`）与「升级完成通知」都算这一类：
+       * 前者是 `['upgrade-now', 'upgrade-later']`，后者是 `['ack']`。
        */
-      const effectiveActions = isUpgradeCard ? actions : autoActions
+      const effectiveActions = (isUpgradeCard || isUpgradeGate) ? actions : autoActions
       /**
        * 按钮表由**宿主**决定（`actions` 字段），客户端只负责画。
        *
@@ -641,6 +671,25 @@ window.__ModuleLoader__.load({
           title: watermark.dismissible === true
             ? '收起这条提示（不再出现）'
             : '先收起这条提示（还在用 WorkBuddy 时它会再次出现）',
+        },
+        /**
+         * 升级确认卡片上的两个按钮。
+         *
+         * 文案刻意用「现在升级 / 稍后」而不是「确定 / 取消」：前者说的是
+         * 时机，后者听起来像「取消升级这件事」，而推迟 ≠ 取消——30 分钟后
+         * 它还会再来问一次。
+         */
+        'upgrade-now': {
+          label: '现在升级',
+          running: '正在升级…',
+          className: 'dsh-wbg-btn--hard',
+          title: '暂停正在跑的会话，升级 dsh-connect-workbuddy，装好后自动让它们继续',
+        },
+        'upgrade-later': {
+          label: '稍后',
+          running: '稍后…',
+          className: '',
+          title: '这次先不升级，30 分钟后会再问你一次',
         },
       }
       /** 按算出来的顺序画；未知 action 直接忽略。 */
