@@ -1216,6 +1216,48 @@ async function main() {
   if (!NO_UPGRADE) connectLatest = await readPluginLatest()
   const connectVersion = connectInstalledVersion ?? null
 
+  /**
+   * **「目标版本其实已经装上了」要把 `upgrade` 状态自愈成 `done`。**
+   *
+   * `issueUpgrade()` 重发前只看 `attempts` 与 `status`，不看磁盘上现装的是
+   * 什么。于是会出现这种死状态（2026-11-18 Debian 那台的真实现场）：
+   *
+   *   · `guard.upgrade = { status: 'failed', attempts: 2, to: '5.24.14' }`
+   *     —— 额度用尽，`issueUpgrade()` 以后只会打一行「不再重试」；
+   *   · 而 `node_modules/dsh-connect-workbuddy` 现在**就是** 5.24.14，
+   *     是宿主 `pluginManager.updateBundle` 装成的；
+   *   · `installed === latest` ⇒ `pluginNewer === false` ⇒
+   *     `upgradePlugin()` 从此不会再被调用 ⇒ 谁也不会来改这个 `failed`。
+   *
+   * 结果：`--status` 与界面上永远是「升级失败」，而事实是早就好了。
+   * 更糟的是它连带影响判定——用户看到「升级失败 + 红牌还在」，会以为
+   * 是插件坏了。
+   *
+   * 这里只改 `status`，**不抬 `revision`**：水印的生命周期不该由这条
+   * 记账修复来驱动（清水印是上面那段「风险窗口已关闭」的职责）。
+   */
+  if (!MODE_CHECK && !DRY_RUN) {
+    const guardFile = readGuardFile()
+    const pendingUpgrade = guardFile.upgrade
+    const target = pendingUpgrade?.to
+    if (pendingUpgrade !== null && pendingUpgrade !== undefined
+      && pendingUpgrade.status !== 'done'
+      && typeof target === 'string' && target !== ''
+      && connectInstalledVersion === target
+    ) {
+      guardFile.upgrade = {
+        ...pendingUpgrade,
+        status: 'done',
+        method: pendingUpgrade.method ?? 'external',
+        at: nowIso(),
+        note: '目标版本已在磁盘上（由本插件之外的途径装成），状态自愈为 done',
+      }
+      writeJsonAtomic(GUARD_FILE, guardFile)
+      log('info', `升级目标 ${target} 已经在磁盘上（状态还停在 `
+        + `${pendingUpgrade.status}/${pendingUpgrade.attempts ?? '?'}）—— 标记为 done，不抬 revision`)
+    }
+  }
+
   const events = []
   const firstRun = !state.baseline
   const reported = new Set(state.reportedKeys ?? [])
@@ -1363,6 +1405,83 @@ async function main() {
         to: judgedVersion,
         connectVersion: connectInstalledVersion ?? null,
         connectBaseline: recordedConnect ?? null,
+      }
+    }
+  }
+
+  /**
+   * **风险窗口关闭时，把残留的危险水印清掉。**
+   *
+   * 这是本脚本唯一一条「条件解除 → 主动清水印」的路径。它的缺席曾造成
+   * 一个长期挂着的死水印（2026-11-18 用户实测，Debian 那台）：
+   *
+   *   · 用户点了「关闭插件」，`finalizeWatermark` 把水印改写成收尾形态
+   *     （`pendingDisable: false` + `handledBy`），**刻意不清空**；
+   *   · 之后 `dsh-connect-workbuddy` 是**宿主**（`pluginManager.updateBundle`）
+   *     升上去的，`--enable` 从未发生 ⇒ 那条注释里假设的出口不存在；
+   *   · 于是每一轮检查都算出 `mismatch: false`，然后…什么都不做。
+   *     38 轮检查、1.9 小时，水印纹丝不动。
+   *
+   * **判据不能是 `!mismatch`。** 这是第一版写错的地方，实测第二圈就把刚挂上的
+   * 红牌清掉了：`mismatch` 是**边沿触发**的（「WB 这一轮变了没有」），而报警
+   * 那一轮结束时基线就推进到了新版本，下一轮 `wbMismatch` 必然为 false ——
+   * 风险明明还开着（新 WB 配旧 connect），边沿信号却说「没事了」。
+   *
+   * 真正的语义是「**这个具体的风险配对还成立吗**」，所以拿**水印上记下的那份
+   * 配对**去比对磁盘现在的事实：
+   *
+   *   水印记的 connectVersion  ≠  现在装的 connectVersion  →  connect 动过
+   *                                                          ⇒ 作者已适配 / 用户
+   *                                                            已升级，窗口关闭
+   *   相等                                               →  仍是「新 WB 配旧
+   *                                                          connect」，不清
+   *
+   * 用「动过」而不是「够新」，理由与 `connectCaughtUp` 同一套（见上面第 1 节
+   * 的长注释）：判断的是**配对是否被打断**，不是谁的版本号更大。
+   *
+   * `judgeable` 仍然必要，它挡掉两种「不是解除」的 false：
+   *   · `judgedVersion === null`（所有平台读不到）—— 这正是最该保留告警的场景
+   *   · `firstRun` / `reanchor`（刚重新落基线）—— 不构成解除的证据
+   *
+   * 老水印没有 `connectVersion` 字段时**不清**（保守）：那时无法证明配对被打断，
+   * 而误清一张真红牌的代价远大于多挂一会儿。用户可以 `--clear-watermark` 或
+   * `--enable` 手动收尾。
+   *
+   * 走 `updateWatermark(null)` 而不是直接改 guard.json：它会 `revision += 1`，
+   * 客户端的 `snoozedRevision` / `finishedRevision` 都绑在 revision 上，
+   * 抬一位就自动复位，不需要额外的通知机制。
+   *
+   * **只清危险牌。** 升级通知（`dismissible` / `untilRestart`）有自己的
+   * 生命周期（重启即失效 / 点知道了永久收起），不该被这一条顺手抹掉。
+   */
+  const judgeable = judgedVersion !== null && !firstRun && !reanchor
+  // `!mismatch`：这一轮**刚刚**判定出新的风险配对，水印要被下面第 4 节重建成
+  // 新的（带最新 connectVersion），这里抢先清掉只会白抬一次 revision。
+  if (judgeable && !mismatch && !MODE_CHECK && !DRY_RUN) {
+    const guardNow = readGuardFile()
+    const stale = guardNow.watermark
+    if (stale !== null && stale !== undefined
+      && stale.level === 'danger'
+      // 升级类水印不归这里管（它们不是「风险窗口」的表示）
+      && stale.dismissible !== true
+      && stale.untilRestart !== true
+    ) {
+      const watermarkConnect = typeof stale.connectVersion === 'string' && stale.connectVersion !== ''
+        ? stale.connectVersion
+        : null
+      const connectMoved = watermarkConnect !== null
+        && connectInstalledVersion !== null
+        && connectInstalledVersion !== undefined
+        && watermarkConnect !== connectInstalledVersion
+      if (connectMoved) {
+        const ageMs = Date.now() - Date.parse(String(stale.at ?? ''))
+        const ageText = Number.isFinite(ageMs) && ageMs >= 0
+          ? `已挂 ${Math.round(ageMs / 60000)} 分钟`
+          : '挂出时间未知'
+        const revision = updateWatermark(null)
+        log('info', `风险窗口已关闭（水印记的 ${BUNDLE} ${watermarkConnect} → 现装 `
+          + `${connectInstalledVersion}，WB 判定 ${judgedVersion}）—— 清掉残留水印`
+          + `（原 detail ${stale.detail ?? '?'}，${ageText}，revision → ${revision}）`)
       }
     }
   }

@@ -32,6 +32,7 @@ dsh plugin --profile web add dsh-workbuddy-account-care   # 然后重启 DSH
 |---|---|
 | WorkBuddy 版本 ≠ 基线，且 `dsh-connect-workbuddy` 没动过 | 红色水印（+ 桌面通知），等你选「软结束 / 硬结束 / 知道了」。**默认不自动停用** |
 | WorkBuddy 版本 ≠ 基线，但 `dsh-connect-workbuddy` 也换过版本 | 视为作者已适配，只记一条日志，不报警 |
+| 危险水印挂着，而 `dsh-connect-workbuddy` 后来换过版本 | 风险窗口已关闭 → **自动清掉那条水印** |
 | npm 上 `dsh-connect-workbuddy` 有新版 | 自动升级，成功后挂水印（要重启就说要重启，热生效就说已生效） |
 | 同上，但在 Desktop 且有 wb 会话在跑 | 先弹「现在升级 / 稍后」，点了才升：暂停会话 → 升级 → 自动让它们继续 |
 | 第一次跑 / 判定平台集合变过 | 只落基线，不报警 |
@@ -44,7 +45,9 @@ flowchart TD
   B -- 装了 --> C["探 5 个平台：判 3 个、记 2 个"]
   C --> D["每平台 接口版本 ↔ 文件名版本 取高<br/>三平台之间再取高 = 判定版本"]
   D --> E{"判定版本 ≠ 基线？"}
-  E -- 否 --> Z["无变化"]
+  E -- 否 --> E2{"危险水印还挂着，<br/>而 connect 换过版本？"}
+  E2 -- 是 --> E3["风险窗口已关闭<br/>自动清掉水印（revision +1）"]
+  E2 -- 否 --> Z
   E -- 是 --> F{"connect 版本也变了？"}
   F -- 是 --> Z2["作者已适配，不报警"]
   F -- 否 --> G["写 guard.json：红牌水印 pendingDisable"]
