@@ -232,14 +232,25 @@ npx dsh-workbuddy-account-care check --simulate-version 9.9.9.99999   # 演练�
     startupDelayMs: 3000    # 加载后多久跑第一次；0 = 立刻
     notify: true            # false = 不弹桌面通知（Windows 没有原生通道，只记日志）
     pollMs: 2000            # 宿主读指令文件的间隔
-    profile: web            # 目标 profile（建议显式写，见下）
+    profile: web            # 一般不用写，见下
 ```
 
-**建议显式写 `profile`**：脚本要去某个 profile 里找 `dsh-connect-workbuddy`。取值顺序是
-`--profile-dir` → `--profile` / `config.profile` → 环境变量 `DSH_PROFILE` → 按
-`desktop`、`web` 顺序串行探测（第一个真装了目标插件的胜出）。**DSH Desktop 从托盘启动时
-不带 `DSH_PROFILE`**，于是可能查错目录、报「未安装」再整轮静默——看起来像没工作。
-排障时先看 `check --status` 里的 `profileResolution.source`，`detected-miss` 就是它。
+**通常不需要配 `profile`。** 插件从宿主的 `profileContext`（`ctx.get('profileContext')`）
+直接读出自己在哪个 profile 里跑，再把 `profileContext.dir` 用 `--profile-dir` 传给
+`watch.mjs`——脚本照着这个目录办事，不猜、也不去翻别人的 profile。
+
+`watch.mjs` 单独跑时的取值顺序是 `--profile-dir` → `--profile` / `config.profile` →
+环境变量 `DSH_PROFILE` → 按 `desktop`、`web` 顺序串行探测（第一个真装了目标插件的胜出）。
+最后那步只服务手工在终端里跑脚本的场景；宿主派发时永远走第一条。
+
+**读不到就报错，不猜。** 早先这里硬编码兜底成 `desktop`，于是 npm 版（profile 名是
+`web`）必然猜错——`dsh plugin --profile desktop add …` 会把包装进用户根本没在跑的
+那份 profile，`--disable` 也会去错误的目录找包、找不到就静默跳过，表现就是
+「点关闭插件没反应、水印永远不消失」。现在拿不到 profile 信息时，升级会明确报
+`unknown-profile` 并让你手动处理。
+
+排障时看 `check --status` 里的 `profileResolution.source`：`profileContext` 是正常的，
+`detected-miss` 说明脚本没拿到目录、自己探测也没找到装过目标插件的 profile。
 
 策略文件 `~/.dsh/workbuddy-update-watch/config.json`（改完不必重启）：
 
