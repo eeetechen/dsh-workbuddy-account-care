@@ -86,7 +86,6 @@ const STOP_TEXT = '本机 provider 已更新，本条消息由监控插件自动
 const HOME = process.env.HOME || process.env.USERPROFILE || homedir()
 const DSH_HOME = process.env.DSH_HOME || join(HOME, '.dsh')
 const STATE_DIR = join(DSH_HOME, 'workbuddy-update-watch')
-const DEFAULT_PROFILE = process.env.DSH_PROFILE || 'web'
 
 /**
  * 上游版本接口的 platform 标识。
@@ -182,9 +181,14 @@ const SIMULATE_PLUGIN = opt('--simulate-plugin', null)
  *    `dsh-connect-workbuddy` 的胜出**。
  *
  * 为什么要有第 3 条：DSH Desktop 是 Electron 应用，宿主进程从托盘/快捷方式启动时
- * **不带** `DSH_PROFILE` 环境变量，于是 `DEFAULT_PROFILE` 回落到硬编码的 `'web'`，
- * 而用户实际用的是 `desktop` profile。结果脚本去 `profiles/web` 里找目标插件，
- * 找不到就整轮静默跳过 —— 看起来像插件没工作，实际是查错了目录。
+ * **不带** `DSH_PROFILE` 环境变量。早期版本在这里硬编码回落 `'web'`，而用户实际
+ * 用的是 `desktop` profile，于是脚本去 `profiles/web` 里找目标插件，找不到就整轮
+ * 静默跳过 —— 看起来像插件没工作，实际是查错了目录。
+ *
+ * **现在的宿主半会把 `profileContext.dir` 用 `--profile-dir` 传下来**
+ * （见 index.js 的 `profileArgs()`），所以正常运行时第 1 条就命中，第 3 条只服务
+ * 「手工在终端里跑脚本」这一种场景。这样脚本永远改的就是插件自己所在的那份
+ * profile，不会跨 profile 认领。
  *
  * 探测是**串行**的（不是并行）：本脚本用 `run.lock` 做全局互斥，并行会互相抢锁。
  * 而一次探测只要读一个 `package.json`，串行的代价可以忽略。
@@ -217,9 +221,21 @@ function guardTargetInProfileDir(dir) {
 /**
  * 解析出最终使用的 profile 与目录。
  *
- * `--profile` 显式给出时只认它（精确语义，便于排障）；否则按候选顺序探测，
- * 命中即停；全都没命中时回落到默认候选首位，让后续走既有的
- * 「未安装则完全静默」路径 —— 那条路径不写基线、不改 profile、不挂水印。
+ * 优先级（**和 index.js 的 `resolveProfileInfo()` 保持一致**）：
+ *
+ *   1. `--profile-dir` —— 目录已给定，**不再探测**。宿主半从
+ *      `ctx.get('profileContext').dir` 拿到自己正在跑的目录，直接传下来。
+ *      这是唯一不会认错的形式：插件在哪个 profile 里跑，脚本就改哪份。
+ *   2. `--profile` —— 显式给了名字，只认它（精确语义，便于排障）。
+ *   3. `config.json` 的 `profile` —— 用户写死的偏好。
+ *   4. 都没给 —— 按候选顺序探测，**第一个真正装了目标包的胜出**。
+ *
+ * ⚠️ 第 4 条只在**没有宿主派发参数**时才走到（手工在终端里跑脚本的场景）。
+ * 早先无论宿主给没给，脚本都自己探测一遍，于是「装了 desktop + web 两份 profile」
+ * 的机器上，插件在 `web` 里跑却可能认领 `desktop` 的配置去改——跨 profile 认领。
+ *
+ * 全都没命中时回落到候选首位，让后续走既有的「未安装则完全静默」路径 ——
+ * 那条路径不写基线、不改 profile、不挂水印。
  */
 function resolveProfile() {
   if (EXPLICIT_PROFILE_DIR) {

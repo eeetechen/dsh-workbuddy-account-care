@@ -313,19 +313,76 @@ function splitSpec(spec) {
 }
 
 /**
- * 当前 profile 名。CLI 升级路径要用它（`dsh plugin --profile <p> add`）。
+ * 当前 profile 是从哪来的、叫什么、目录在哪。
  *
- * Desktop 的宿主进程**不导出 `DSH_PROFILE`**，所以这里的兜底不是可选的：
- * 读 `config.profile`（`apply` 里传进来的），再退到环境变量，最后用 `desktop`。
- * 与 `scripts/watch.mjs` 的 `resolveProfile()` 是同一套优先级，只是插件本体
- * 没有候选探测能力（它不该去扫别人的 profile 目录）。
+ * **首选 `ctx.get('profileContext')`，那是宿主给的权威答案。**
+ *
+ * DSH 在启动时就把这个对象 `provide` 到 context 上了（见
+ * `dsh/src/profile-boot.ts:338`：`hostCtx.provide('profileContext', profileContext)`），
+ * 字段是 `{ name, dir, patchPath, installAnchor, startedBundles, cwd, home, … }`。
+ * `dsh-shell-env` 正是从它读出 `DSH_PROFILE` / `DSH_PROFILE_DIR` 再导给子进程的
+ * （`dsh-shell-env/src/index.ts:176-181`），也就是说：**插件能直接拿到，
+ * 不需要靠环境变量、更不需要猜。**
+ *
+ * ⚠️ 早先这里是 `config.profile → DSH_PROFILE → 'desktop'` 硬编码兜底。
+ * Desktop 宿主进程确实不导出 `DSH_PROFILE`，于是最后那步「猜 desktop」在
+ * **npm 版（`dsh web`，profile 名是 `web`）上必然猜错**——`dsh plugin --profile
+ * desktop add …` 会去装到另一个 profile 里，或者干脆报「先打开 Desktop 一次」。
+ * 猜错比不做更糟：它会把包装进用户根本没在跑的那份 profile。
+ *
+ * 优先级（改了就同步改 `scripts/watch.mjs` 的 `resolveProfile()`）：
+ *   1. `ctx.get('profileContext')` —— 权威，永远最新
+ *   2. `config.profile` —— 用户在 patch 里显式指定（排障用）
+ *   3. `process.env.DSH_PROFILE` —— 手工在终端里跑脚本时的兜底
+ *   4. 都没有 → `null`，调用方据此跳过需要 profile 名的动作，而不是猜一个
+ *
+ * **`dir` 只从 `profileContext` 或 `DSH_PROFILE_DIR` 取，不从 `profile` 名拼。**
+ * 用名字去拼 `<DSH_HOME>/profiles/<name>` 会踩到一个很隐蔽的坑：测试和
+ * 任何用 `DSH_HOME` 做隔离、却没清 `DSH_PROFILE` 的环境，会拿着真实的
+ * profile 名去拼临时目录，于是脚本跑去改**另一个真实 profile**——既有
+ * 测试 `schedule-behaviour` 就是这么被带偏的（每轮多写几行日志，被
+ * 「日志行数」计数的用例当场判失败）。
+ *
+ * @param {object} ctx - Cordis context
+ * @param {object} config - 插件配置
+ * @returns {{ name: string, dir: string|null, source: string } | null}
  */
-function profileName(config) {
+function resolveProfileInfo(ctx, config) {
+  let fromContext = null
+  try {
+    fromContext = ctx?.get?.('profileContext') ?? null
+  } catch { /* 服务没装（精简 profile）就当没有 */ }
+  if (fromContext !== null && typeof fromContext.name === 'string' && fromContext.name !== '') {
+    return {
+      name: fromContext.name,
+      dir: typeof fromContext.dir === 'string' && fromContext.dir !== '' ? fromContext.dir : null,
+      source: 'profileContext',
+    }
+  }
   const fromConfig = typeof config?.profile === 'string' ? config.profile.trim() : ''
-  if (fromConfig !== '') return fromConfig
+  if (fromConfig !== '') return { name: fromConfig, dir: null, source: 'config' }
   const fromEnv = process.env.DSH_PROFILE?.trim()
-  if (fromEnv) return fromEnv
-  return 'desktop'
+  if (fromEnv) {
+    /**
+     * 名字与目录**必须成对**，不能拿名字去拼目录。
+     *
+     * `DSH_PROFILE_DIR` 缺失时宁可不给目录（让脚本自己按名字解析），也不要
+     * 用 `${DSH_HOME}/profiles/${name}` 猜——那个组合在 DSH_HOME 被重定向过
+     * 的环境里指向的是**毫不相干的另一个 profile**。
+     */
+    return { name: fromEnv, dir: process.env.DSH_PROFILE_DIR?.trim() || null, source: 'env' }
+  }
+  return null
+}
+
+/**
+ * 只要名字（CLI 升级路径拼 `dsh plugin --profile <p> add <spec>` 用）。
+ *
+ * 拿不到就返回 `null`——**不再兜底成 `'desktop'`**。用一个猜出来的 profile
+ * 去装包，后果是「装进了用户没在跑的那份 profile」，比不装更糟。
+ */
+function profileName(ctx, config) {
+  return resolveProfileInfo(ctx, config)?.name ?? null
 }
 
 /** 读状态文件；不存在或读坏都当成「没有水印、没有指令」。 */
@@ -764,11 +821,27 @@ export function apply(ctx, config = {}) {
    * 但用户至少能再点一次。
    */
   const DISABLE_TIMEOUT_MS = 30_000
+  /**
+   * 子进程要用的 profile 参数。
+   *
+   * **优先直接给目录**（`--profile-dir`），那是唯一不会认错的形式：
+   * `profileContext.dir` 就是本进程正在跑的 profile 目录，脚本照它办事，
+   * 不必再去 `~/.dsh/profiles/*` 里探测——探测会越过自己的 profile 去翻
+   * 别人的目录，在「装了多个 profile」的机器上就会改错那一份。
+   *
+   * 拿不到目录时退回名字（`--profile`）。名字再拿不到就**什么都不传**，
+   * 让 `resolveProfile()` 走它自己的探测/回落逻辑——不传参数比传一个猜的
+   * 名字安全：脚本的探测至少有「谁真的装了目标包」这个判据。
+   */
+  function profileArgs() {
+    const info = resolveProfileInfo(ctx, config)
+    if (info !== null && info.dir !== null) return ['--profile-dir', info.dir]
+    if (info !== null && info.name !== '') return ['--profile', info.name]
+    return []
+  }
   function disableCurrentBundle() {
     return new Promise((resolve) => {
-      const args = [WATCH_SCRIPT, '--disable']
-      const profile = config.profile ?? process.env.DSH_PROFILE
-      if (typeof profile === 'string' && profile !== '') args.push('--profile', profile)
+      const args = [WATCH_SCRIPT, '--disable', ...profileArgs()]
       let child
       let settled = false
       // `finish` 会用到 timer，先声明再赋值，避免 TDZ（error 事件可能在
@@ -1246,11 +1319,33 @@ export function apply(ctx, config = {}) {
     // 2) 命令行
     const cli = findDshCli()
     if (cli !== null) {
+      /**
+       * **profile 名拿不到就不要拼 `--profile`。**
+       *
+       * `dsh plugin add` 在不给 `--profile` 时会用 CLI 自己的默认 profile，
+       * 那至少是「用户启动 `dsh` 时用的那个」，比插件猜一个名字强。
+       *
+       * 早先这里兜底成硬编码的 `'desktop'`，于是 npm 版（profile 叫 `web`）
+       * 会被命令去装 `desktop` 那份——装完用户看不到任何变化，或者直接报
+       * 「先打开 Desktop 一次」。
+       */
+      const name = profileName(ctx, config)
+      if (name === null) {
+        logger.warn?.('[workbuddy-guard] 读不到当前 profile 名（没有 profileContext / 没配 profile / '
+          + '没有 DSH_PROFILE），跳过 CLI 升级路径；宿主服务不可用时请手动升级')
+      }
       return {
         kind: 'dsh-cli',
         label: `CLI ${cli.command}`,
         async run(spec) {
-          const args = ['plugin', '--profile', profileName(config), 'add', spec]
+          if (name === null) {
+            return {
+              ok: false,
+              method: 'dsh-cli',
+              error: 'unknown-profile：读不到 profile 名，不敢猜一个去装包，请手动升级',
+            }
+          }
+          const args = ['plugin', '--profile', name, 'add', spec]
           const out = await spawnCapture(cli.command, [...cli.prefix, ...args])
           if (out.ok) return { ok: true, method: 'dsh-cli', output: out.stdout.slice(-2000) }
           return { ok: false, method: 'dsh-cli', error: out.error }
@@ -2124,9 +2219,7 @@ export function apply(ctx, config = {}) {
    */
   function runWatchOnce() {
     return new Promise((resolve) => {
-      const args = [WATCH_SCRIPT]
-      const profile = config.profile ?? process.env.DSH_PROFILE
-      if (typeof profile === 'string' && profile !== '') args.push('--profile', profile)
+      const args = [WATCH_SCRIPT, ...profileArgs()]
       if (config.notify === false) args.push('--no-notify')
 
       let settled = false
@@ -2338,4 +2431,4 @@ export const DEFAULT_WATERMARK = {
 }
 
 /** 测试出口：不参与插件契约，只有 test/ 里的用例 import 它。 */
-export { usesWorkbuddy, resolveStartupDelayMs, resolveRecheckDelayMs, planNextCheck, DEFAULT_STARTUP_DELAY_MS, MISSING_RETRY_MS, MISSING_RETRY_LIMIT, EVENT_RECHECK_DELAY_MS }
+export { usesWorkbuddy, resolveStartupDelayMs, resolveRecheckDelayMs, planNextCheck, DEFAULT_STARTUP_DELAY_MS, MISSING_RETRY_MS, MISSING_RETRY_LIMIT, EVENT_RECHECK_DELAY_MS, resolveProfileInfo, profileName }

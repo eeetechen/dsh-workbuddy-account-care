@@ -17,6 +17,18 @@ import { apply, DEFAULT_STARTUP_DELAY_MS, EVENT_RECHECK_DELAY_MS } from '../inde
 const dir = mkdtempSync(join(tmpdir(), 'wb-sched-'))
 const logFile = join(dir, 'workbuddy-update-watch', 'watch.log')
 process.env.DSH_HOME = dir
+/**
+ * **必须一起清掉 profile 相关的环境变量。**
+ *
+ * 宿主半现在优先用 `ctx.get('profileContext')`，没有时退到 `DSH_PROFILE` /
+ * `DSH_PROFILE_DIR`（见 index.js 的 `resolveProfileInfo()`）。本用例的假 ctx
+ * 没有 profileContext，如果测试进程自己带着开发机上的 `DSH_PROFILE=desktop`
+ * （在 DSH 里跑 `npm test` 时就会这样），脚本就会被派去改**真实的那个
+ * profile**——既有副作用，也会让「数日志行数」的判据失灵（真实 profile 里
+ * 装了目标包，脚本走的是完整判定流程，一轮写 3 行而不是 1 行）。
+ */
+delete process.env.DSH_PROFILE
+delete process.env.DSH_PROFILE_DIR
 // 不可达地址：脚本会立刻失败返回，不阻塞用例
 process.env.WORKBUDDY_WATCH_UPSTREAM = 'http://127.0.0.1:1/v2/update'
 

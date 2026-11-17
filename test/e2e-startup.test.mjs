@@ -54,6 +54,13 @@ const dir = mkdtempSync(join(tmpdir(), 'wb-guard-home-'))
 /** 脚本把日志写到 `$DSH_HOME/workbuddy-update-watch/watch.log`。 */
 const logFile = join(dir, 'workbuddy-update-watch', 'watch.log')
 process.env.DSH_HOME = dir
+/**
+ * 与 `schedule-behaviour.test.mjs` 同理：宿主半会从 `DSH_PROFILE` /
+ * `DSH_PROFILE_DIR` 里读 profile（没有 profileContext 时）。测试进程若带着
+ * 开发机上的那对变量，脚本就会被派去改真实 profile。
+ */
+delete process.env.DSH_PROFILE
+delete process.env.DSH_PROFILE_DIR
 process.env.WORKBUDDY_WATCH_VERBOSE = '1'
 const ctx = fakeCtx()
 const startedAt = Date.now()
