@@ -751,29 +751,56 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 派脚本停用 bundle（`--disable` 只停用、不检测）。 */
+  /**
+   * 派脚本停用 bundle（`--disable` 只停用、不检测）。
+   *
+   * **必须有超时。** 用户实测「有时候点关闭插件无法关闭」（2026-11-17）：这条
+   * 路原先只在 `close` 事件里 resolve，子进程要是卡住（读写 profile 时被别的
+   * 写者挡住、脚本自身 await 一个永不返回的探测），Promise 就永远不 settle，
+   * 于是 `/action` 那条 HTTP 请求挂到天荒地老、`actionInFlight` 一直是
+   * `'close'`，用户再点只会拿到 409 busy——表现就是「点了没反应，也关不掉」。
+   *
+   * 超时后按**失败**返回，水印保持待确认（这是对的：没停成就不该说处理完了），
+   * 但用户至少能再点一次。
+   */
+  const DISABLE_TIMEOUT_MS = 30_000
   function disableCurrentBundle() {
     return new Promise((resolve) => {
       const args = [WATCH_SCRIPT, '--disable']
       const profile = config.profile ?? process.env.DSH_PROFILE
       if (typeof profile === 'string' && profile !== '') args.push('--profile', profile)
       let child
+      let settled = false
+      // `finish` 会用到 timer，先声明再赋值，避免 TDZ（error 事件可能在
+      // setTimeout 赋值之前就被排上）
+      let timer
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result)
+      }
       try {
         child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
       } catch (error) {
         resolve({ ok: false, error: String(error?.message || error) })
         return
       }
+      timer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* 已退出 */ }
+        finish({ ok: false, error: `disable-timeout: ${DISABLE_TIMEOUT_MS}ms 内没有返回` })
+      }, DISABLE_TIMEOUT_MS)
+      timer.unref?.()
       let stdout = ''
       let stderr = ''
       child.stdout?.on('data', (chunk) => { stdout += String(chunk) })
       child.stderr?.on('data', (chunk) => { stderr += String(chunk) })
-      child.on('error', (error) => resolve({ ok: false, error: String(error?.message || error) }))
+      child.on('error', (error) => finish({ ok: false, error: String(error?.message || error) }))
       child.on('close', (code) => {
         const line = stdout.trim().split('\n').filter(Boolean).pop()
         let parsed
         try { parsed = JSON.parse(line) } catch { parsed = undefined }
-        resolve({ ok: code === 0, code, result: parsed, stderr: stderr.trim().slice(0, 400) })
+        finish({ ok: code === 0, code, result: parsed, stderr: stderr.trim().slice(0, 400) })
       })
     })
   }
@@ -882,23 +909,38 @@ export function apply(ctx, config = {}) {
     if (!disabled.ok) logger.error?.(`[workbuddy-guard] 停用失败: ${disabled.error ?? disabled.stderr ?? disabled.code}`)
 
     /**
-     * **只有真的停用了才把水印改成「已处理」。**
+     * **什么时候算「停用成功」。**
      *
      * 早先这里无条件调用 `finalizeWatermark`，于是停用失败时也把
      * `pendingDisable` 改成 false、清掉 actions——用户看到卡片从「等你选」变成
-     * 一条没有按钮的静态提示，还以为是处理完了，实际上 bundle 仍在 bundles 里、
-     * provider 仍然可用。这就是「水印消失了、但 WB provider 没被禁用」的成因。
+     * 一条静态提示，还以为是处理完了，实际上 bundle 仍在 bundles 里、provider
+     * 仍然可用。这就是「水印消失了、但 WB provider 没被禁用」的成因。
      *
-     * 现在的语义：
-     *   - 停用成功 → 水印转为「已处理」（不带按钮，跟随 provider 选择显示）
-     *   - 停用失败 → 水印**原样保留**（仍是 pendingDisable、按钮还在），
-     *     用户可以再点一次；失败原因写进日志，界面也会显示「操作失败」
+     * 但也不能矫枉过正成「只认 changed === true」。用户实测反馈
+     * （2026-11-17）：**有时候点「关闭插件」关不掉，水印一直赖着**。
+     *
+     * 成因：`disableBundle` 是幂等的——插件**已经**不在 `bundles` 里时它返回
+     * `{ changed: false, reason: 'already-disabled' }`（见 scripts/watch.mjs:570）。
+     * 只认 `changed === true` 的话，「本来就已经关了」被判成失败：水印保持
+     * `pendingDisable: true`、按钮不动，再点还是 `already-disabled`——**死循环，
+     * 永远关不掉**，而那一刻 provider 其实早就不存在了，卡片与现实正好相反。
+     *
+     * 所以判据是「**目的达成了吗**」，不是「这次改动了什么」：
+     *   - `changed: true`            → 真关掉了
+     *   - `reason: already-disabled` → 目的已达成（幂等成功）
+     *   - 其它（verify-failed-rolled-back / manifest 读不出来 / spawn 失败 /
+     *     30 秒超时）→ 失败，水印原样保留，用户可以再点一次，失败原因写进日志
      */
     const disabledOk = disabled.ok
-      && (disabled.result?.changed === true || disabled.result?.result?.changed === true)
+      && (
+        disabled.result?.changed === true
+        || disabled.result?.result?.changed === true
+        || disabled.result?.result?.reason === 'already-disabled'
+      )
     if (disabledOk) {
       await finalizeWatermark(state.file, action)
-      logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：bundle 已停用`)
+      logger.warn?.(`[workbuddy-guard] 动作 ${action} 完成：bundle 已停用`
+        + `${disabled.result?.changed === true || disabled.result?.result?.changed === true ? '' : '（本来就已经是关的）'}`)
     } else {
       const detail = disabled.error ?? disabled.stderr ?? (disabled.result?.result?.reason ?? 'unknown')
       logger.error?.(`[workbuddy-guard] 动作 ${action}：bundle **未**停用（${detail}），水印保持待确认`)
@@ -1328,7 +1370,6 @@ export function apply(ctx, config = {}) {
     if (watermark === null || watermark === undefined) return watermark
     const busy = hasBackgroundWorkbuddySession()
     const isPending = watermark.pendingDisable === true
-    const handled = watermark.handledBy !== undefined
     /**
      * **升级通知只有「知道了」，不要给它「关闭插件」。**
      *
@@ -1357,15 +1398,31 @@ export function apply(ctx, config = {}) {
      * 语义就是「只能点知道了」。
      */
     const gated = watermark.upgradeGate !== undefined
+    /**
+     * **待确认（WB 刚更新、插件还开着）不再给「关闭插件」。**
+     *
+     * 用户实测反馈（2026-11-17）：WB 客户端更新后弹出的水印上是
+     * 「关闭插件 / 知道了」，可那一刻他根本没打算关插件，点下去直接把
+     * provider 掐了——这不该是个一键就能按掉的按钮。需求第 17 行也据此改成
+     * 「没后台任务时……一个按钮。这里不要关闭插件」。
+     *
+     * 收敛后的矩阵（`pendingDisable === true`，即「等你决定」阶段）：
+     *   有后台 wb 会话在跑 → soft / hard / ack（用户决定怎么掐断）
+     *   没有后台会话      → **只有 ack**（先不关，等真的用起来再说）
+     *
+     * 已处理之后（`handledBy` 存在 = 用户自己把它强开回来了）仍然按需求
+     * 第 23-28 行给：后台还在跑 → 只有 ack（强提醒）；前台选着 wb、后台停了
+     * → close / ack（他自己开回来的，就该还能在界面上关掉）。
+     */
     const actions = gated
       ? (Array.isArray(watermark.actions) ? watermark.actions : ['upgrade-now', 'upgrade-later'])
       : isUpgradeNotice
         ? ['ack']
         : closed
           ? ['ack']
-          : ((!isPending || handled)
-              ? ['close', 'ack']
-              : (busy ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
+          : isPending
+            ? (busy ? ['soft', 'hard', 'ack'] : ['ack'])
+            : (busy ? ['ack'] : ['close', 'ack'])
     const same = Array.isArray(watermark.actions)
       && watermark.actions.length === actions.length
       && watermark.actions.every((a, i) => a === actions[i])

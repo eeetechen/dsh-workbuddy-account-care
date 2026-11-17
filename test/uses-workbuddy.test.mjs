@@ -67,6 +67,29 @@ test('options.provider=workbuddy、投影是空对象 → 不命中', () => {
   assert.equal(usesWorkbuddy(agent, { modelSelection: {} }), null)
 })
 
+// ---- 回归：next / lastUsed 存在但是 null（新建会话）----
+//
+// 2026-11-17，用户报「WB 更新了，后台明明有 wb 会话在跑，水印却只有
+// 关闭插件/知道了」。根因在**客户端**（client.js 的 `guarded` 只挡了
+// `undefined`，没挡 `null`，读 `null.provider` 抛 TypeError，被 catch 把
+// running/selected 一起清成 false）。
+//
+// 宿主这一侧写的是 `if (current && ...)`，本来就是对的——这组用例把它钉住，
+// 免得将来「对齐两边」时反而把宿主改成客户端的写法。
+test('投影 next/lastUsed 都是 null（新建会话）→ 不命中，且不抛异常', () => {
+  const agent = fakeAgent({ options: {}, lastAssistant: null })
+  const got = usesWorkbuddy(agent, { modelSelection: { lastUsed: null, next: null } })
+  assert.equal(got, null)
+})
+
+test('投影 next 是 null 但 lastUsed 是 workbuddy → 回退命中', () => {
+  const agent = fakeAgent({ options: {}, lastAssistant: null })
+  const got = usesWorkbuddy(agent, {
+    modelSelection: { lastUsed: { provider: 'workbuddy', model: 'hy4free' }, next: null },
+  })
+  assert.equal(got, 'workbuddy/hy4free')
+})
+
 // ---- 降级路径：投影不可用时要求双证据 ----
 test('投影不可用 + 配置与最后一条 assistant 都是 workbuddy → 命中', () => {
   const agent = fakeAgent({ options: { provider: 'workbuddy', model: 'hy4free' }, lastAssistant: 'workbuddy' })

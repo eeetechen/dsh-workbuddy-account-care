@@ -298,10 +298,27 @@ window.__ModuleLoader__.load({
       )
       React.useEffect(() => {
         if (sessions === undefined || sessions === null) return
+        /**
+         * 这条会话用的是不是 workbuddy 系。
+         *
+         * ⚠️ **`pick` 可能是 `null`，不是 `undefined`。**
+         *
+         * `modelSelection` 的投影是 `{ lastUsed, next: pending ?? lastUsed }`，
+         * 新会话两个字段都**存在但是 null**。早先这里只挡了 `undefined`：
+         *   `pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)`
+         * 于是 `pick` 为 null 时短路条件成立，继续读 `null.provider` 抛
+         * `TypeError: Cannot read properties of null (reading 'provider')`，
+         * 被下面 `read()` 的 catch 接住，**把 running 和 selected 一起清成 false**。
+         *
+         * 后果不是「少提示一条」，而是**整个按钮组合判反**：明明后台有 wb 会话
+         * 在跑，`hasBackground` 却是 false，水印显示成「关闭插件 / 知道了」，
+         * 而不是「软结束 / 硬结束 / 知道了」。宿主侧的 `usesWorkbuddy` 写的是
+         * `if (current && ...)`，两边不对称，这是漏改的一处。
+         */
         const guarded = (row) => {
           const selection = row?.projectionValues?.modelSelection
           const pick = selection?.next ?? selection?.lastUsed
-          return pick !== undefined && GUARDED_PROVIDERS.includes(pick.provider)
+          return pick !== undefined && pick !== null && GUARDED_PROVIDERS.includes(pick.provider)
         }
         const read = () => {
           let running = false
@@ -476,9 +493,10 @@ window.__ModuleLoader__.load({
        *   永久收起 —— 这条提示的使命已经完成，再弹只会烦人：
        *     · 升级通知（`dismissible` 热生效 / `untilRestart` 要重启）——
        *       需求 2「点击之后直接消失」
-       *     · 待确认、但**没有**后台 wb 会话（两按钮「关闭插件 / 知道了」）：
-       *       需求第 19 行「点了之后消失」——没有任何正在跑的东西要提醒，
-       *       用户看过就够了
+       *     · 待确认、但**没有**后台 wb 会话（只剩一个「知道了」）：
+       *       需求第 17 / 19 行「一个按钮……点了之后消失」——没有任何正在跑的
+       *       东西要提醒，用户看过就够了。注意这里**不是**「关闭插件」：
+       *       需求第 17 行明确「这里不要关闭插件」。
        *
        *   消失再重现 —— 强提醒，风险还在：
        *     · 待确认、且有后台 wb 会话（三按钮，需求第 15 行）
@@ -611,21 +629,24 @@ window.__ModuleLoader__.load({
        *
        * 客户端这边订阅了 `sessions`，会话一停就立刻重算，天然是实时的。
        *
-       * 规则（需求 3）：
-       *   有后台 wb 会话在跑        → soft / hard / ack
-       *   没有后台任务（仅前台选中） → close / ack
-       *   **插件已经关了**          → 只有 ack
+       * 规则（需求 3，2026-11-17 修订版）：
+       *   插件已经关了                        → 只有 ack
+       *   待确认 + 有后台 wb 在跑             → soft / hard / ack
+       *   待确认 + 没后台任务                 → **只有 ack**（需求第 17 行：
+       *                                        「这里不要关闭插件」——不摆一个
+       *                                        用户并不想按、按了就直接掐掉的按钮）
+       *   已处理 + 后台还在跑（强提醒期）     → 只有 ack（需求第 23-24 行）
+       *   已处理 + 用户强开着插件、后台停了   → close / ack（需求第 26-28 行：
+       *                                        他自己开回来的，就该能再关掉）
        *
-       * 已处理过的水印（`handledBy` 存在）本来用 close/ack：它只在用户强开
-       * 插件后才出现，此时该做的事就是再关掉。但如果插件当前就是关着的，
-       * 「关闭插件」是个空动作——用户点了什么也不会发生，只会困惑。
-       * 所以先看 `bundleEnabled`：false 就只剩「知道了」。
+       * 早先「没后台任务」给的是 close/ack，用户实测反馈那一版的水印上写着
+       * 「关闭插件」，可插件其实已经被上一步动作关掉了——按钮是个空动作。
        */
       const autoActions = bundleClosed
         ? ['ack']
-        : ((watermark.handledBy !== undefined || !isPending)
-            ? ['close', 'ack']
-            : (hasBackground ? ['soft', 'hard', 'ack'] : ['close', 'ack']))
+        : isPending
+          ? (hasBackground ? ['soft', 'hard', 'ack'] : ['ack'])
+          : (hasBackground ? ['ack'] : ['close', 'ack'])
       /**
        * 升级类水印保留宿主给的 actions，与有没有会话无关。
        *
